@@ -38,8 +38,8 @@ export interface Preset {
   settings: Settings;
 }
 
-const PRESETS_KEY = "woodshed.presets.v1";
-const LAST_KEY = "woodshed.last.v1";
+const PRESETS_KEY = "ggcoder-metronome.presets.v1";
+const LAST_KEY = "ggcoder-metronome.last.v1";
 
 function safeParse<T>(raw: string | null): T | null {
   if (!raw) return null;

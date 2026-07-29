@@ -21,7 +21,7 @@ const tapTempo = new TapTempo();
 const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `
   <header class="shell">
-    <h1>Woodshed<span class="subtitle">drummer's metronome</span></h1>
+    <h1>GGCoder Metronome<span class="subtitle">drummer's metronome</span></h1>
   </header>
   <main class="shell">
     <section class="panel tempo" aria-label="Tempo">

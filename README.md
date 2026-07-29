@@ -1,4 +1,4 @@
-# Woodshed
+# GGCoder Metronome
 
 A drummer's metronome for the web — Tama Rhythm Watch features and then some.
 
