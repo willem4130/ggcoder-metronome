@@ -688,9 +688,25 @@ kbd {
     transform: rotate(180deg);
   }
 
+  /* Scrollport must announce itself: always-visible thin scrollbar, stable
+     gutter, and a boundary line so clipped rows don't read as overlapped
+     by the save-song section below. */
   .song-list {
     max-height: 38vh;
     overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+    scrollbar-gutter: stable;
+    border-bottom: 1px solid var(--border-dim);
+  }
+
+  .song-list::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  .song-list::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 999px;
   }
 
   .mixer {
