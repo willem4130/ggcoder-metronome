@@ -3,18 +3,23 @@ import { MetronomeEngine } from "./engine";
 import {
   defaultAccents,
   loadLastSettings,
-  loadPresets,
+  loadSetlists,
+  loadUiState,
   saveLastSettings,
-  savePresets,
+  saveSetlists,
+  saveUiState,
   type BeatAccent,
-  type Preset,
+  type Setlist,
   type Settings,
+  type Song,
+  type UiState,
   type Voice,
 } from "./state";
 import { clampBpm, MAX_BPM, MIN_BPM, TapTempo, type Layer } from "./timing";
 
 const settings: Settings = loadLastSettings();
-let presets: Preset[] = loadPresets();
+let setlists: Setlist[] = loadSetlists();
+const ui: UiState = loadUiState();
 const engine = new MetronomeEngine(() => settings);
 const tapTempo = new TapTempo();
 
@@ -23,7 +28,8 @@ app.innerHTML = `
   <header class="shell">
     <h1>GGCoder Metronome<span class="subtitle">drummer's metronome</span></h1>
   </header>
-  <main class="shell">
+  <main class="shell" id="main-shell">
+    <div class="pillar pillar-metronome">
     <section class="panel tempo" aria-label="Tempo">
       <p class="bpm-readout" id="bpm-readout" aria-live="off">
         <span id="bpm-value">${settings.bpm}</span>
@@ -46,14 +52,70 @@ app.innerHTML = `
       <button type="button" class="btn-primary" id="startstop" aria-pressed="false">Start</button>
       <p class="visually-hidden" role="status" id="sr-status"></p>
     </section>
+    </div>
 
+    <div class="pillar" id="pillar-setlist">
+      <button type="button" class="pillar-rail" id="rail-setlist"
+        aria-expanded="true" aria-controls="pillar-setlist-body">
+        <span class="rail-label">Setlist</span>
+        <span class="rail-chevron" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="pillar-body" id="pillar-setlist-body">
+        <section class="panel" aria-labelledby="setlist-h">
+          <h2 id="setlist-h">Setlist</h2>
+          <div class="field-row">
+            <div class="field" style="flex:1">
+              <label for="setlist-select">Setlist</label>
+              <select id="setlist-select" style="width:100%"></select>
+            </div>
+          </div>
+          <div class="field-row setlist-actions">
+            <button type="button" id="setlist-new">New</button>
+            <button type="button" id="setlist-rename">Rename</button>
+            <button type="button" id="setlist-delete">Delete</button>
+          </div>
+          <ol class="song-list" id="song-list"></ol>
+          <p class="empty-note" id="song-empty">No songs yet. Dial in a groove and save it.</p>
+          <div class="field-row" style="margin-top: var(--gap-2)">
+            <div class="field" style="flex:1">
+              <label for="song-name">Song name</label>
+              <input type="text" id="song-name" class="text-input" placeholder="e.g. Tom Sawyer" />
+            </div>
+            <button type="button" id="song-save">Save song</button>
+          </div>
+          <div class="transport-row">
+            <button type="button" id="song-prev" aria-label="Previous song">&larr; Prev</button>
+            <button type="button" id="song-next" aria-label="Next song">Next &rarr;</button>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div class="pillar" id="pillar-satellites">
+      <button type="button" class="pillar-rail" id="rail-satellites"
+        aria-expanded="true" aria-controls="pillar-satellites-body">
+        <span class="rail-label">Tools</span>
+        <span class="rail-chevron" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="pillar-body" id="pillar-satellites-body">
     <section class="panel" aria-labelledby="mixer-h">
-      <h2 id="mixer-h">Subdivision mixer</h2>
-      <div class="mixer" id="mixer"></div>
+      <h2><button type="button" class="panel-toggle" id="toggle-mixer"
+        aria-expanded="true" aria-controls="mixer-body">
+        <span id="mixer-h">Subdivision mixer</span>
+        <span class="rail-chevron" aria-hidden="true">&#9662;</span>
+      </button></h2>
+      <div class="panel-body" id="mixer-body">
+        <div class="mixer" id="mixer"></div>
+      </div>
     </section>
 
     <section class="panel" aria-labelledby="sound-h">
-      <h2 id="sound-h">Sound</h2>
+      <h2><button type="button" class="panel-toggle" id="toggle-sound"
+        aria-expanded="true" aria-controls="sound-body">
+        <span id="sound-h">Sound</span>
+        <span class="rail-chevron" aria-hidden="true">&#9662;</span>
+      </button></h2>
+      <div class="panel-body" id="sound-body">
       <div class="field-row">
         <div class="field">
           <label for="voice">Voice</label>
@@ -68,10 +130,16 @@ app.innerHTML = `
           <input type="range" id="master" min="0" max="100" value="${Math.round(settings.masterVolume * 100)}" />
         </div>
       </div>
+      </div>
     </section>
 
     <section class="panel" aria-labelledby="trainers-h">
-      <h2 id="trainers-h">Trainers</h2>
+      <h2><button type="button" class="panel-toggle" id="toggle-trainers"
+        aria-expanded="true" aria-controls="trainers-body">
+        <span id="trainers-h">Trainers</span>
+        <span class="rail-chevron" aria-hidden="true">&#9662;</span>
+      </button></h2>
+      <div class="panel-body" id="trainers-body">
       <div class="field-row">
         <div class="toggle-field">
           <input type="checkbox" id="gap-on" ${settings.gap.enabled ? "checked" : ""} />
@@ -105,27 +173,15 @@ app.innerHTML = `
         </div>
       </div>
       <p class="trainer-status" id="trainer-status"></p>
-    </section>
-
-    <section class="panel" aria-labelledby="presets-h">
-      <h2 id="presets-h">Presets</h2>
-      <div class="field-row">
-        <div class="field" style="flex:1">
-          <label for="preset-name">Name</label>
-          <input type="text" id="preset-name" placeholder="e.g. Tom Sawyer bridge"
-            style="width:100%; min-height:44px; font:inherit; color:var(--text);
-            background:var(--surface-2); border:1px solid var(--border);
-            border-radius:var(--radius); padding:0 var(--gap-1)" />
-        </div>
-        <button type="button" id="preset-save">Save preset</button>
       </div>
-      <ul class="preset-list" id="preset-list" style="margin-top: var(--gap-2)"></ul>
-      <p class="empty-note" id="preset-empty">No presets yet. Dial in a groove and save it.</p>
     </section>
+      </div>
+    </div>
 
     <p class="shortcuts">
       <kbd>Space</kbd> start/stop &nbsp; <kbd>&uarr;</kbd><kbd>&darr;</kbd> &plusmn;1 BPM &nbsp;
-      <kbd>&larr;</kbd><kbd>&rarr;</kbd> &plusmn;5 BPM &nbsp; <kbd>T</kbd> tap tempo
+      <kbd>&larr;</kbd><kbd>&rarr;</kbd> &plusmn;5 BPM &nbsp; <kbd>T</kbd> tap tempo &nbsp;
+      <kbd>N</kbd>/<kbd>P</kbd> next/prev song
     </p>
   </main>
 `;
@@ -276,60 +332,198 @@ bindNumber("sp-to", (n) => (settings.speed.toBpm = clampBpm(n)));
 bindNumber("sp-step", (n) => (settings.speed.stepBpm = Math.max(1, n)));
 bindNumber("sp-every", (n) => (settings.speed.everyBars = Math.max(1, n)));
 
-/* ---------- Presets ---------- */
+/* ---------- Setlists ---------- */
 
-const presetList = $<HTMLUListElement>("preset-list");
-const presetEmpty = $<HTMLParagraphElement>("preset-empty");
-const presetName = $<HTMLInputElement>("preset-name");
+const setlistSelect = $<HTMLSelectElement>("setlist-select");
+const songList = $<HTMLOListElement>("song-list");
+const songEmpty = $<HTMLParagraphElement>("song-empty");
+const songName = $<HTMLInputElement>("song-name");
 
-function renderPresets(): void {
-  presetList.innerHTML = "";
-  presetEmpty.hidden = presets.length > 0;
-  presets.forEach((p, i) => {
+function saveUi(): void {
+  saveUiState(ui);
+}
+
+function activeSetlist(): Setlist | null {
+  return setlists.find((s) => s.id === ui.activeSetlistId) ?? setlists[0] ?? null;
+}
+
+function setActiveSetlist(id: string | null): void {
+  ui.activeSetlistId = id;
+  ui.activeSongId = null;
+  saveUi();
+  renderSetlists();
+}
+
+function renderSetlists(): void {
+  const active = activeSetlist();
+  if (active && ui.activeSetlistId !== active.id) {
+    ui.activeSetlistId = active.id;
+    saveUi();
+  }
+  setlistSelect.innerHTML = "";
+  for (const sl of setlists) {
+    const opt = document.createElement("option");
+    opt.value = sl.id;
+    opt.textContent = sl.name;
+    setlistSelect.appendChild(opt);
+  }
+  setlistSelect.disabled = setlists.length === 0;
+  if (active) setlistSelect.value = active.id;
+  renderSongs();
+}
+
+function renderSongs(): void {
+  const songs = activeSetlist()?.songs ?? [];
+  songList.innerHTML = "";
+  songEmpty.hidden = songs.length > 0;
+  songs.forEach((song, i) => {
     const li = document.createElement("li");
+    if (song.id === ui.activeSongId) li.classList.add("active");
+
     const load = document.createElement("button");
     load.type = "button";
-    load.className = "preset-load";
-    load.innerHTML = `<span>${escapeHtml(p.name)}</span>
-      <span class="preset-meta">${p.settings.bpm} BPM &middot; ${p.settings.beatsPerBar}/4</span>`;
-    load.setAttribute("aria-label", `Load preset ${p.name}, ${p.settings.bpm} BPM`);
-    load.addEventListener("click", () => {
-      Object.assign(settings, structuredClone(p.settings));
-      setBpm(settings.bpm);
-      renderLamps();
-      syncInputs();
-      persist();
-      announce(`Loaded ${p.name}`);
-    });
+    load.className = "song-load";
+    load.innerHTML = `<span class="song-order">${i + 1}</span>
+      <span class="song-title">${escapeHtml(song.name)}</span>
+      <span class="preset-meta">${song.settings.bpm} BPM</span>`;
+    load.setAttribute("aria-label", `Load song ${song.name}, ${song.settings.bpm} BPM`);
+    load.addEventListener("click", () => loadSong(song));
+
+    const up = document.createElement("button");
+    up.type = "button";
+    up.className = "song-move";
+    up.textContent = "\u2191";
+    up.disabled = i === 0;
+    up.setAttribute("aria-label", `Move ${song.name} up`);
+    up.addEventListener("click", () => moveSong(i, -1));
+
+    const down = document.createElement("button");
+    down.type = "button";
+    down.className = "song-move";
+    down.textContent = "\u2193";
+    down.disabled = i === songs.length - 1;
+    down.setAttribute("aria-label", `Move ${song.name} down`);
+    down.addEventListener("click", () => moveSong(i, 1));
+
     const del = document.createElement("button");
     del.type = "button";
-    del.textContent = "Delete";
-    del.setAttribute("aria-label", `Delete preset ${p.name}`);
+    del.className = "song-move";
+    del.textContent = "\u2715";
+    del.setAttribute("aria-label", `Delete song ${song.name}`);
     del.addEventListener("click", () => {
-      presets.splice(i, 1);
-      savePresets(presets);
-      renderPresets();
+      songs.splice(i, 1);
+      if (ui.activeSongId === song.id) {
+        ui.activeSongId = null;
+        saveUi();
+      }
+      saveSetlists(setlists);
+      renderSongs();
     });
-    li.append(load, del);
-    presetList.appendChild(li);
+
+    li.append(load, up, down, del);
+    songList.appendChild(li);
   });
+}
+
+function moveSong(index: number, delta: number): void {
+  const songs = activeSetlist()?.songs ?? [];
+  const target = index + delta;
+  if (target < 0 || target >= songs.length) return;
+  [songs[index], songs[target]] = [songs[target], songs[index]];
+  saveSetlists(setlists);
+  renderSongs();
+}
+
+function loadSong(song: Song): void {
+  Object.assign(settings, structuredClone(song.settings));
+  setBpm(settings.bpm);
+  renderLamps();
+  syncInputs();
+  persist();
+  ui.activeSongId = song.id;
+  saveUi();
+  renderSongs();
+  announce(`Loaded ${song.name}`);
+}
+
+function stepSong(delta: number): void {
+  const songs = activeSetlist()?.songs ?? [];
+  if (songs.length === 0) return;
+  const idx = songs.findIndex((s) => s.id === ui.activeSongId);
+  const next =
+    idx < 0
+      ? delta > 0
+        ? 0
+        : songs.length - 1
+      : Math.min(songs.length - 1, Math.max(0, idx + delta));
+  if (next === idx) return;
+  loadSong(songs[next]);
 }
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 
-$("preset-save").addEventListener("click", () => {
-  const name = presetName.value.trim() || `${settings.bpm} BPM`;
-  const existing = presets.findIndex((p) => p.name === name);
-  const preset: Preset = { name, settings: structuredClone(settings) };
-  if (existing >= 0) presets[existing] = preset;
-  else presets.push(preset);
-  savePresets(presets);
-  presetName.value = "";
-  renderPresets();
+setlistSelect.addEventListener("change", () => setActiveSetlist(setlistSelect.value));
+
+$("setlist-new").addEventListener("click", () => {
+  const name = window.prompt("New setlist name", `Setlist ${setlists.length + 1}`)?.trim();
+  if (!name) return;
+  const sl: Setlist = { id: crypto.randomUUID(), name, songs: [] };
+  setlists.push(sl);
+  saveSetlists(setlists);
+  setActiveSetlist(sl.id);
+  announce(`Created setlist ${name}`);
+});
+
+$("setlist-rename").addEventListener("click", () => {
+  const active = activeSetlist();
+  if (!active) return;
+  const name = window.prompt("Rename setlist", active.name)?.trim();
+  if (!name) return;
+  active.name = name;
+  saveSetlists(setlists);
+  renderSetlists();
+});
+
+$("setlist-delete").addEventListener("click", () => {
+  const active = activeSetlist();
+  if (!active) return;
+  const count = active.songs.length;
+  if (!window.confirm(`Delete setlist "${active.name}"${count ? ` and its ${count} songs` : ""}?`))
+    return;
+  setlists = setlists.filter((s) => s.id !== active.id);
+  saveSetlists(setlists);
+  setActiveSetlist(setlists[0]?.id ?? null);
+  announce(`Deleted ${active.name}`);
+});
+
+$("song-save").addEventListener("click", () => {
+  let active = activeSetlist();
+  if (!active) {
+    active = { id: crypto.randomUUID(), name: "Setlist 1", songs: [] };
+    setlists.push(active);
+    ui.activeSetlistId = active.id;
+  }
+  const name = songName.value.trim() || `${settings.bpm} BPM`;
+  const existing = active.songs.find((s) => s.name === name);
+  if (existing) {
+    existing.settings = structuredClone(settings);
+    ui.activeSongId = existing.id;
+  } else {
+    const song: Song = { id: crypto.randomUUID(), name, settings: structuredClone(settings) };
+    active.songs.push(song);
+    ui.activeSongId = song.id;
+  }
+  saveSetlists(setlists);
+  saveUi();
+  songName.value = "";
+  renderSetlists();
   announce(`Saved ${name}`);
 });
+
+$("song-prev").addEventListener("click", () => stepSong(-1));
+$("song-next").addEventListener("click", () => stepSong(1));
 
 function syncInputs(): void {
   $<HTMLInputElement>("beats").value = String(settings.beatsPerBar);
@@ -347,7 +541,61 @@ function syncInputs(): void {
   $<HTMLInputElement>("sp-every").value = String(settings.speed.everyBars);
 }
 
-renderPresets();
+renderSetlists();
+
+/* ---------- Collapsible pillars & panels ---------- */
+
+const mainShell = $<HTMLElement>("main-shell");
+
+function bindPillar(
+  railId: string,
+  pillarId: string,
+  bodyId: string,
+  key: "setlistPaneHidden" | "satellitesPaneHidden",
+  shellClass: string,
+): void {
+  const rail = $<HTMLButtonElement>(railId);
+  const pillar = $(pillarId);
+  const body = $(bodyId);
+  const apply = (): void => {
+    const hidden = ui[key];
+    pillar.classList.toggle("collapsed", hidden);
+    mainShell.classList.toggle(shellClass, hidden);
+    body.hidden = hidden;
+    rail.setAttribute("aria-expanded", String(!hidden));
+  };
+  rail.addEventListener("click", () => {
+    ui[key] = !ui[key];
+    saveUi();
+    apply();
+  });
+  apply();
+}
+
+bindPillar("rail-setlist", "pillar-setlist", "pillar-setlist-body", "setlistPaneHidden", "setlist-hidden");
+bindPillar("rail-satellites", "pillar-satellites", "pillar-satellites-body", "satellitesPaneHidden", "satellites-hidden");
+
+function bindPanelToggle(toggleId: string, bodyId: string, panelKey: string): void {
+  const toggle = $<HTMLButtonElement>(toggleId);
+  const body = $(bodyId);
+  const apply = (): void => {
+    const collapsed = ui.collapsedPanels.includes(panelKey);
+    body.hidden = collapsed;
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+  };
+  toggle.addEventListener("click", () => {
+    ui.collapsedPanels = ui.collapsedPanels.includes(panelKey)
+      ? ui.collapsedPanels.filter((k) => k !== panelKey)
+      : [...ui.collapsedPanels, panelKey];
+    saveUi();
+    apply();
+  });
+  apply();
+}
+
+bindPanelToggle("toggle-mixer", "mixer-body", "mixer");
+bindPanelToggle("toggle-sound", "sound-body", "sound");
+bindPanelToggle("toggle-trainers", "trainers-body", "trainers");
 
 /* ---------- Transport + visuals ---------- */
 
@@ -438,5 +686,15 @@ document.addEventListener("keydown", (e) => {
       if (bpm !== null) setBpm(bpm);
       break;
     }
+    case "n":
+    case "N":
+      if (typing) return;
+      stepSong(1);
+      break;
+    case "p":
+    case "P":
+      if (typing) return;
+      stepSong(-1);
+      break;
   }
 });
