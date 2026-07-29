@@ -475,14 +475,35 @@ button:active {
   display: flex;
   align-items: center;
   gap: var(--gap-1);
+  padding-block: var(--gap-1);
+}
+
+.song-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .song-title {
-  flex: 1;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+}
+
+.song-artist {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.song-band {
+  flex-shrink: 0;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 8px;
 }
 
 .song-order {
@@ -511,15 +532,53 @@ button:active {
   cursor: default;
 }
 
-.transport-row {
+.song-form {
   display: flex;
+  flex-direction: column;
   gap: var(--gap-1);
   margin-top: var(--gap-2);
 }
 
-.transport-row button {
+.song-form .field-row {
+  gap: var(--gap-1);
+}
+
+/* ---------- Face transport (current/next song on the metronome face) ---------- */
+
+.face-transport[hidden] {
+  display: none;
+}
+
+.face-transport {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-1);
+  margin-top: var(--gap-2);
+  padding: var(--gap-1);
+  background: var(--well);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 10px;
+  box-shadow: inset 0 2px 12px rgba(0, 0, 0, 0.6);
+}
+
+.face-transport-info {
   flex: 1;
+  min-width: 0;
+  text-align: center;
+}
+
+.face-transport-now {
+  margin: 0;
   font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.face-transport-next {
+  margin: 2px 0 0;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
 }
 
 .preset-meta {
@@ -625,7 +684,8 @@ kbd {
 
 @media (min-width: 960px) {
   .shell {
-    max-width: 1200px;
+    max-width: none;
+    padding-inline: var(--gap-3);
   }
 
   header.shell {
@@ -634,20 +694,21 @@ kbd {
 
   main.shell {
     display: grid;
-    grid-template-columns: minmax(340px, 1fr) minmax(260px, 0.8fr) minmax(280px, 0.9fr);
-    grid-template-rows: auto auto;
+    grid-template-columns: minmax(360px, 1fr) minmax(440px, 1.7fr) minmax(300px, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
     gap: 12px var(--gap-2);
-    align-items: start;
+    align-items: stretch;
+    min-height: calc(100dvh - 68px);
     padding-top: 12px;
     padding-bottom: var(--gap-2);
   }
 
   main.shell.setlist-hidden {
-    grid-template-columns: minmax(340px, 1fr) 44px minmax(280px, 0.9fr);
+    grid-template-columns: minmax(360px, 1.2fr) 44px minmax(300px, 1fr);
   }
 
   main.shell.satellites-hidden {
-    grid-template-columns: minmax(340px, 1fr) minmax(260px, 0.8fr) 44px;
+    grid-template-columns: minmax(360px, 1fr) minmax(440px, 1.7fr) 44px;
   }
 
   main.shell.setlist-hidden.satellites-hidden {
@@ -656,6 +717,9 @@ kbd {
 
   .pillar {
     min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
   }
 
   .pillar section.panel,
@@ -663,8 +727,34 @@ kbd {
     margin-top: 0;
   }
 
-  .pillar-body > section.panel + section.panel {
-    margin-top: 12px;
+  /* Pillar bodies stretch so all three columns end on the same grid line;
+     the last panel absorbs the leftover height. */
+  .pillar-body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .pillar-body[hidden] {
+    display: none;
+  }
+
+  .pillar-body > section.panel:last-child {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .pillar-metronome section.panel.tempo {
+    flex: 1;
+    align-content: start;
+  }
+
+  #pillar-setlist-body > section.panel {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
   }
 
   .pillar-body section.panel:not(.tempo) {
@@ -690,9 +780,11 @@ kbd {
 
   /* Scrollport must announce itself: always-visible thin scrollbar, stable
      gutter, and a boundary line so clipped rows don't read as overlapped
-     by the save-song section below. */
+     by the save-song section below. Flexes to fill the setlist panel so
+     the pillar bottoms stay flush. */
   .song-list {
-    max-height: 38vh;
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
     scrollbar-width: thin;
     scrollbar-color: var(--border) transparent;

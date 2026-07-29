@@ -3,15 +3,18 @@ import { MetronomeEngine } from "./engine";
 import {
   defaultAccents,
   loadLastSettings,
+  loadLibrary,
   loadSetlists,
   loadUiState,
+  resolveSongs,
   saveLastSettings,
+  saveLibrary,
   saveSetlists,
   saveUiState,
   type BeatAccent,
+  type LibrarySong,
   type Setlist,
   type Settings,
-  type Song,
   type UiState,
   type Voice,
 } from "./state";
@@ -19,6 +22,7 @@ import { clampBpm, MAX_BPM, MIN_BPM, TapTempo, type Layer } from "./timing";
 
 const settings: Settings = loadLastSettings();
 let setlists: Setlist[] = loadSetlists();
+const library: LibrarySong[] = loadLibrary();
 const ui: UiState = loadUiState();
 const engine = new MetronomeEngine(() => settings);
 const tapTempo = new TapTempo();
@@ -50,6 +54,14 @@ app.innerHTML = `
         </div>
       </div>
       <button type="button" class="btn-primary" id="startstop" aria-pressed="false">Start</button>
+      <div class="face-transport" id="face-transport" hidden>
+        <button type="button" id="song-prev" aria-label="Previous song">&larr;</button>
+        <div class="face-transport-info">
+          <p class="face-transport-now" id="transport-now"></p>
+          <p class="face-transport-next" id="transport-next"></p>
+        </div>
+        <button type="button" id="song-next" aria-label="Next song">&rarr;</button>
+      </div>
       <p class="visually-hidden" role="status" id="sr-status"></p>
     </section>
     </div>
@@ -76,16 +88,22 @@ app.innerHTML = `
           </div>
           <ol class="song-list" id="song-list"></ol>
           <p class="empty-note" id="song-empty">No songs yet. Dial in a groove and save it.</p>
-          <div class="field-row" style="margin-top: var(--gap-2)">
-            <div class="field" style="flex:1">
-              <label for="song-name">Song name</label>
-              <input type="text" id="song-name" class="text-input" placeholder="e.g. Tom Sawyer" />
+          <div class="song-form">
+            <div class="field">
+              <label for="song-title">Title</label>
+              <input type="text" id="song-title" class="text-input" placeholder="e.g. Tom Sawyer" />
+            </div>
+            <div class="field-row">
+              <div class="field" style="flex:1">
+                <label for="song-artist">Artist</label>
+                <input type="text" id="song-artist" class="text-input" placeholder="e.g. Rush" />
+              </div>
+              <div class="field" style="flex:1">
+                <label for="song-band">Band</label>
+                <input type="text" id="song-band" class="text-input" placeholder="e.g. Cover band" />
+              </div>
             </div>
             <button type="button" id="song-save">Save song</button>
-          </div>
-          <div class="transport-row">
-            <button type="button" id="song-prev" aria-label="Previous song">&larr; Prev</button>
-            <button type="button" id="song-next" aria-label="Next song">Next &rarr;</button>
           </div>
         </section>
       </div>
@@ -337,7 +355,12 @@ bindNumber("sp-every", (n) => (settings.speed.everyBars = Math.max(1, n)));
 const setlistSelect = $<HTMLSelectElement>("setlist-select");
 const songList = $<HTMLOListElement>("song-list");
 const songEmpty = $<HTMLParagraphElement>("song-empty");
-const songName = $<HTMLInputElement>("song-name");
+const songTitle = $<HTMLInputElement>("song-title");
+const songArtist = $<HTMLInputElement>("song-artist");
+const songBand = $<HTMLInputElement>("song-band");
+const faceTransport = $<HTMLDivElement>("face-transport");
+const transportNow = $<HTMLParagraphElement>("transport-now");
+const transportNext = $<HTMLParagraphElement>("transport-next");
 
 function saveUi(): void {
   saveUiState(ui);
@@ -372,8 +395,16 @@ function renderSetlists(): void {
   renderSongs();
 }
 
+function activeSongs(): LibrarySong[] {
+  return resolveSongs(activeSetlist(), library);
+}
+
+function songLabel(song: LibrarySong): string {
+  return song.artist ? `${song.title} \u2014 ${song.artist}` : song.title;
+}
+
 function renderSongs(): void {
-  const songs = activeSetlist()?.songs ?? [];
+  const songs = activeSongs();
   songList.innerHTML = "";
   songEmpty.hidden = songs.length > 0;
   songs.forEach((song, i) => {
@@ -384,9 +415,13 @@ function renderSongs(): void {
     load.type = "button";
     load.className = "song-load";
     load.innerHTML = `<span class="song-order">${i + 1}</span>
-      <span class="song-title">${escapeHtml(song.name)}</span>
+      <span class="song-main">
+        <span class="song-title">${escapeHtml(song.title)}</span>
+        ${song.artist ? `<span class="song-artist">${escapeHtml(song.artist)}</span>` : ""}
+      </span>
+      ${song.band ? `<span class="song-band">${escapeHtml(song.band)}</span>` : ""}
       <span class="preset-meta">${song.settings.bpm} BPM</span>`;
-    load.setAttribute("aria-label", `Load song ${song.name}, ${song.settings.bpm} BPM`);
+    load.setAttribute("aria-label", `Load song ${songLabel(song)}, ${song.settings.bpm} BPM`);
     load.addEventListener("click", () => loadSong(song));
 
     const up = document.createElement("button");
@@ -394,7 +429,7 @@ function renderSongs(): void {
     up.className = "song-move";
     up.textContent = "\u2191";
     up.disabled = i === 0;
-    up.setAttribute("aria-label", `Move ${song.name} up`);
+    up.setAttribute("aria-label", `Move ${song.title} up`);
     up.addEventListener("click", () => moveSong(i, -1));
 
     const down = document.createElement("button");
@@ -402,16 +437,18 @@ function renderSongs(): void {
     down.className = "song-move";
     down.textContent = "\u2193";
     down.disabled = i === songs.length - 1;
-    down.setAttribute("aria-label", `Move ${song.name} down`);
+    down.setAttribute("aria-label", `Move ${song.title} down`);
     down.addEventListener("click", () => moveSong(i, 1));
 
     const del = document.createElement("button");
     del.type = "button";
     del.className = "song-move";
     del.textContent = "\u2715";
-    del.setAttribute("aria-label", `Delete song ${song.name}`);
+    del.setAttribute("aria-label", `Remove ${song.title} from setlist`);
     del.addEventListener("click", () => {
-      songs.splice(i, 1);
+      const active = activeSetlist();
+      if (!active) return;
+      active.songIds.splice(i, 1);
       if (ui.activeSongId === song.id) {
         ui.activeSongId = null;
         saveUi();
@@ -423,18 +460,29 @@ function renderSongs(): void {
     li.append(load, up, down, del);
     songList.appendChild(li);
   });
+  renderTransport(songs);
+}
+
+function renderTransport(songs: LibrarySong[]): void {
+  faceTransport.hidden = songs.length === 0;
+  if (songs.length === 0) return;
+  const idx = songs.findIndex((s) => s.id === ui.activeSongId);
+  const current = idx >= 0 ? songs[idx] : null;
+  const next = idx < 0 ? songs[0] : songs[idx + 1] ?? null;
+  transportNow.textContent = current ? songLabel(current) : "No song loaded";
+  transportNext.textContent = next ? `Next: ${songLabel(next)}` : "End of setlist";
 }
 
 function moveSong(index: number, delta: number): void {
-  const songs = activeSetlist()?.songs ?? [];
+  const ids = activeSetlist()?.songIds ?? [];
   const target = index + delta;
-  if (target < 0 || target >= songs.length) return;
-  [songs[index], songs[target]] = [songs[target], songs[index]];
+  if (target < 0 || target >= ids.length) return;
+  [ids[index], ids[target]] = [ids[target], ids[index]];
   saveSetlists(setlists);
   renderSongs();
 }
 
-function loadSong(song: Song): void {
+function loadSong(song: LibrarySong): void {
   Object.assign(settings, structuredClone(song.settings));
   setBpm(settings.bpm);
   renderLamps();
@@ -443,11 +491,11 @@ function loadSong(song: Song): void {
   ui.activeSongId = song.id;
   saveUi();
   renderSongs();
-  announce(`Loaded ${song.name}`);
+  announce(`Loaded ${song.title}`);
 }
 
 function stepSong(delta: number): void {
-  const songs = activeSetlist()?.songs ?? [];
+  const songs = activeSongs();
   if (songs.length === 0) return;
   const idx = songs.findIndex((s) => s.id === ui.activeSongId);
   const next =
@@ -469,7 +517,7 @@ setlistSelect.addEventListener("change", () => setActiveSetlist(setlistSelect.va
 $("setlist-new").addEventListener("click", () => {
   const name = window.prompt("New setlist name", `Setlist ${setlists.length + 1}`)?.trim();
   if (!name) return;
-  const sl: Setlist = { id: crypto.randomUUID(), name, songs: [] };
+  const sl: Setlist = { id: crypto.randomUUID(), name, songIds: [] };
   setlists.push(sl);
   saveSetlists(setlists);
   setActiveSetlist(sl.id);
@@ -489,8 +537,8 @@ $("setlist-rename").addEventListener("click", () => {
 $("setlist-delete").addEventListener("click", () => {
   const active = activeSetlist();
   if (!active) return;
-  const count = active.songs.length;
-  if (!window.confirm(`Delete setlist "${active.name}"${count ? ` and its ${count} songs` : ""}?`))
+  const count = active.songIds.length;
+  if (!window.confirm(`Delete setlist "${active.name}"${count ? ` and its ${count} songs` : ""}? Songs stay in the library.`))
     return;
   setlists = setlists.filter((s) => s.id !== active.id);
   saveSetlists(setlists);
@@ -501,25 +549,39 @@ $("setlist-delete").addEventListener("click", () => {
 $("song-save").addEventListener("click", () => {
   let active = activeSetlist();
   if (!active) {
-    active = { id: crypto.randomUUID(), name: "Setlist 1", songs: [] };
+    active = { id: crypto.randomUUID(), name: "Setlist 1", songIds: [] };
     setlists.push(active);
     ui.activeSetlistId = active.id;
   }
-  const name = songName.value.trim() || `${settings.bpm} BPM`;
-  const existing = active.songs.find((s) => s.name === name);
+  const title = songTitle.value.trim() || `${settings.bpm} BPM`;
+  const artist = songArtist.value.trim();
+  const band = songBand.value.trim();
+  const existing = library.find((s) => s.title === title && s.artist === artist);
+  let song: LibrarySong;
   if (existing) {
     existing.settings = structuredClone(settings);
-    ui.activeSongId = existing.id;
+    if (band) existing.band = band;
+    song = existing;
   } else {
-    const song: Song = { id: crypto.randomUUID(), name, settings: structuredClone(settings) };
-    active.songs.push(song);
-    ui.activeSongId = song.id;
+    song = {
+      id: crypto.randomUUID(),
+      title,
+      artist,
+      ...(band ? { band } : {}),
+      settings: structuredClone(settings),
+    };
+    library.push(song);
   }
+  if (!active.songIds.includes(song.id)) active.songIds.push(song.id);
+  ui.activeSongId = song.id;
+  saveLibrary(library);
   saveSetlists(setlists);
   saveUi();
-  songName.value = "";
+  songTitle.value = "";
+  songArtist.value = "";
+  songBand.value = "";
   renderSetlists();
-  announce(`Saved ${name}`);
+  announce(`Saved ${title}`);
 });
 
 $("song-prev").addEventListener("click", () => stepSong(-1));

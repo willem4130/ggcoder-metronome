@@ -38,16 +38,36 @@ export interface Preset {
   settings: Settings;
 }
 
-export interface Song {
+/** A song saved once in the shared library; setlists reference it by id. */
+export interface LibrarySong {
+  id: string;
+  title: string;
+  /** Empty string when unknown. */
+  artist: string;
+  /** Optional tag, e.g. "Cover band". */
+  band?: string;
+  settings: Settings;
+}
+
+/** Legacy v1 embedded-song shape, kept only for migration. */
+export interface SongV1 {
   id: string;
   name: string;
   settings: Settings;
 }
 
+/** Legacy v1 setlist shape, kept only for migration. */
+export interface SetlistV1 {
+  id: string;
+  name: string;
+  songs: SongV1[];
+}
+
 export interface Setlist {
   id: string;
   name: string;
-  songs: Song[];
+  /** Ordered references into the song library. */
+  songIds: string[];
 }
 
 /** Collapsible-pane flags + last active setlist/song, persisted across sessions. */
@@ -61,7 +81,9 @@ export interface UiState {
 
 const PRESETS_KEY = "ggcoder-metronome.presets.v1";
 const LAST_KEY = "ggcoder-metronome.last.v1";
-const SETLISTS_KEY = "ggcoder-metronome.setlists.v1";
+const SETLISTS_V1_KEY = "ggcoder-metronome.setlists.v1";
+const SETLISTS_KEY = "ggcoder-metronome.setlists.v2";
+const LIBRARY_KEY = "ggcoder-metronome.library.v1";
 const UI_KEY = "ggcoder-metronome.ui.v1";
 
 function safeParse<T>(raw: string | null): T | null {
@@ -73,17 +95,70 @@ function safeParse<T>(raw: string | null): T | null {
   }
 }
 
+export function loadLibrary(): LibrarySong[] {
+  return safeParse<LibrarySong[]>(localStorage.getItem(LIBRARY_KEY)) ?? [];
+}
+
+export function saveLibrary(songs: LibrarySong[]): void {
+  localStorage.setItem(LIBRARY_KEY, JSON.stringify(songs));
+}
+
+/** Maps a setlist's song ids to library entries, silently dropping dangling ids. */
+export function resolveSongs(
+  setlist: Setlist | null,
+  library: LibrarySong[],
+): LibrarySong[] {
+  if (!setlist) return [];
+  const byId = new Map(library.map((s) => [s.id, s]));
+  return setlist.songIds
+    .map((id) => byId.get(id))
+    .filter((s): s is LibrarySong => s !== undefined);
+}
+
 /**
- * Loads setlists, migrating legacy presets once: if no setlists exist yet but
- * old presets do, they become songs in a setlist named "My presets".
- * The legacy presets key is left untouched as a backup.
+ * Migrates v1 setlists (embedded songs) to the library + v2 model.
+ * Song ids are preserved so `ui.activeSongId` stays valid; songs with the
+ * same title and identical settings collapse into one library entry.
+ * Persists both the library and the v2 setlists.
+ */
+function migrateV1Setlists(v1: SetlistV1[]): Setlist[] {
+  const library = loadLibrary();
+  const idByKey = new Map<string, string>();
+  for (const song of library) {
+    idByKey.set(`${song.title}\u0000${JSON.stringify(song.settings)}`, song.id);
+  }
+  const migrated: Setlist[] = v1.map((sl) => ({
+    id: sl.id,
+    name: sl.name,
+    songIds: sl.songs.map((song) => {
+      const settings = { ...defaultSettings(), ...song.settings };
+      const key = `${song.name}\u0000${JSON.stringify(settings)}`;
+      const existingId = idByKey.get(key);
+      if (existingId) return existingId;
+      library.push({ id: song.id, title: song.name, artist: "", settings });
+      idByKey.set(key, song.id);
+      return song.id;
+    }),
+  }));
+  saveLibrary(library);
+  saveSetlists(migrated);
+  return migrated;
+}
+
+/**
+ * Loads v2 setlists, migrating older data once. Chain: v2 → v1 setlists
+ * (embedded songs become library entries, ids preserved) → legacy presets
+ * (wrapped as a "My presets" setlist, then migrated the same way).
+ * Old keys are never deleted — they remain as backups.
  */
 export function loadSetlists(): Setlist[] {
   const existing = safeParse<Setlist[]>(localStorage.getItem(SETLISTS_KEY));
   if (existing) return existing;
+  const v1 = safeParse<SetlistV1[]>(localStorage.getItem(SETLISTS_V1_KEY));
+  if (v1) return migrateV1Setlists(v1);
   const legacy = safeParse<Preset[]>(localStorage.getItem(PRESETS_KEY));
   if (legacy && legacy.length > 0) {
-    const migrated: Setlist[] = [
+    return migrateV1Setlists([
       {
         id: crypto.randomUUID(),
         name: "My presets",
@@ -93,9 +168,7 @@ export function loadSetlists(): Setlist[] {
           settings: { ...defaultSettings(), ...p.settings },
         })),
       },
-    ];
-    saveSetlists(migrated);
-    return migrated;
+    ]);
   }
   return [];
 }
