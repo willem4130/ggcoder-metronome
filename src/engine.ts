@@ -12,6 +12,24 @@ export interface VisualBeat {
 
 const LOOKAHEAD_S = 0.1;
 const TICK_MS = 25;
+const START_LEAD_S = 0.08;
+const STALE_TOLERANCE_S = 0.05;
+
+export interface ScheduleAnchor {
+  nextBeatTime: number;
+  resynced: boolean;
+}
+
+/** Pure stale-clock guard used by the audio scheduler and unit tests. */
+export function resolveScheduleAnchor(
+  nextBeatTime: number,
+  currentTime: number,
+): ScheduleAnchor {
+  if (nextBeatTime < currentTime - STALE_TOLERANCE_S) {
+    return { nextBeatTime: currentTime + START_LEAD_S, resynced: true };
+  }
+  return { nextBeatTime, resynced: false };
+}
 
 /**
  * Lookahead scheduler (the standard "A Tale of Two Clocks" pattern):
@@ -54,7 +72,7 @@ export class MetronomeEngine {
     this.beat = 0;
     this.bar = 0;
     this.visualQueue = [];
-    this.nextBeatTime = this.ctx.currentTime + 0.08;
+    this.nextBeatTime = this.ctx.currentTime + START_LEAD_S;
     this.timer = setInterval(() => this.schedule(), TICK_MS);
   }
 
@@ -64,7 +82,17 @@ export class MetronomeEngine {
       this.timer = null;
     }
     this.visualQueue = [];
-    void this.ctx?.suspend();
+    void this.ctx?.suspend().catch(() => undefined);
+  }
+
+  /** Clears stale visuals and repairs stale lookahead without changing musical counters. */
+  resync(): void {
+    if (!this.running || !this.ctx) return;
+    this.visualQueue = [];
+    this.nextBeatTime = resolveScheduleAnchor(
+      this.nextBeatTime,
+      this.ctx.currentTime,
+    ).nextBeatTime;
   }
 
   /** Pops beats whose time has arrived, for the rAF-driven visualizer. */
@@ -84,6 +112,9 @@ export class MetronomeEngine {
     if (!ctx || !master) return;
     const s = this.getSettings();
     master.gain.value = s.masterVolume;
+    const anchor = resolveScheduleAnchor(this.nextBeatTime, ctx.currentTime);
+    this.nextBeatTime = anchor.nextBeatTime;
+    if (anchor.resynced) this.visualQueue = [];
 
     while (this.nextBeatTime < ctx.currentTime + LOOKAHEAD_S) {
       const bpm = bpmForBar(s.speed, s.bpm, this.bar);

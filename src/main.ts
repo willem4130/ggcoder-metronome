@@ -1,12 +1,15 @@
 import "./style.css";
 import { MetronomeEngine } from "./engine";
 import {
+  createBackupPayload,
   defaultAccents,
   loadLastSettings,
   loadLibrary,
   loadSetlists,
   loadUiState,
-  resolveSongs,
+  parseBackupPayload,
+  resolveSongReferences,
+  restoreBackupPayload,
   saveLastSettings,
   saveLibrary,
   saveSetlists,
@@ -74,7 +77,7 @@ app.innerHTML = `
       </button>
       <div class="pillar-body" id="pillar-setlist-body">
         <section class="panel" aria-labelledby="setlist-h">
-          <h2 id="setlist-h">Setlist</h2>
+          <h2 id="setlist-h">Songs</h2>
           <div class="field-row">
             <div class="field" style="flex:1">
               <label for="setlist-select">Setlist</label>
@@ -85,10 +88,11 @@ app.innerHTML = `
             <button type="button" id="setlist-new">New</button>
             <button type="button" id="setlist-rename">Rename</button>
             <button type="button" id="setlist-delete">Delete</button>
+            <button type="button" id="library-open">Open library</button>
           </div>
           <ol class="song-list" id="song-list"></ol>
           <p class="empty-note" id="song-empty">No songs yet. Dial in a groove and save it.</p>
-          <div class="song-form">
+          <form class="song-form" id="song-form">
             <div class="field">
               <label for="song-title">Title</label>
               <input type="text" id="song-title" class="text-input" placeholder="e.g. Tom Sawyer" />
@@ -103,8 +107,11 @@ app.innerHTML = `
                 <input type="text" id="song-band" class="text-input" placeholder="e.g. Cover band" />
               </div>
             </div>
-            <button type="button" id="song-save">Save song</button>
-          </div>
+            <div class="song-form-actions">
+              <button type="submit" id="song-save">Save new song</button>
+              <button type="button" id="song-update" disabled>Update loaded song</button>
+            </div>
+          </form>
         </section>
       </div>
     </div>
@@ -147,6 +154,10 @@ app.innerHTML = `
           <label for="master">Master volume</label>
           <input type="range" id="master" min="0" max="100" value="${Math.round(settings.masterVolume * 100)}" />
         </div>
+      </div>
+      <div class="toggle-field shortcut-preference">
+        <input type="checkbox" id="single-key-shortcuts" ${ui.singleKeyShortcutsEnabled ? "checked" : ""} />
+        <label for="single-key-shortcuts">Enable T, N, and P single-key shortcuts</label>
       </div>
       </div>
     </section>
@@ -198,10 +209,45 @@ app.innerHTML = `
 
     <p class="shortcuts">
       <kbd>Space</kbd> start/stop &nbsp; <kbd>&uarr;</kbd><kbd>&darr;</kbd> &plusmn;1 BPM &nbsp;
-      <kbd>&larr;</kbd><kbd>&rarr;</kbd> &plusmn;5 BPM &nbsp; <kbd>T</kbd> tap tempo &nbsp;
-      <kbd>N</kbd>/<kbd>P</kbd> next/prev song
+      <kbd>&larr;</kbd><kbd>&rarr;</kbd> &plusmn;5 BPM
+      <span id="single-key-shortcut-legend" ${ui.singleKeyShortcutsEnabled ? "" : "hidden"}>
+        &nbsp; <kbd>T</kbd> tap tempo &nbsp; <kbd>N</kbd>/<kbd>P</kbd> next/prev song
+      </span>
     </p>
   </main>
+
+  <aside class="mobile-transport" id="mobile-transport" aria-label="Compact metronome transport">
+    <button type="button" id="mobile-song-prev" aria-label="Previous song">&larr;</button>
+    <div class="mobile-transport-info">
+      <p class="mobile-bpm"><span id="mobile-bpm-value">${settings.bpm}</span> <span>BPM</span></p>
+      <p id="mobile-transport-now">No song loaded</p>
+      <p id="mobile-transport-next">No songs in setlist</p>
+    </div>
+    <button type="button" class="btn-primary" id="mobile-startstop" aria-pressed="false">Start</button>
+    <button type="button" id="mobile-song-next" aria-label="Next song">&rarr;</button>
+  </aside>
+
+  <dialog id="library-dialog" aria-labelledby="library-heading" aria-describedby="library-status">
+    <div class="dialog-header">
+      <h2 id="library-heading">Song library</h2>
+      <button type="button" id="library-close" aria-label="Close song library">Close</button>
+    </div>
+    <div class="field library-search-field">
+      <label for="library-search">Search songs</label>
+      <input type="search" id="library-search" class="text-input" autocomplete="off" />
+    </div>
+    <p class="library-results-summary" id="library-results-summary" aria-live="polite"></p>
+    <ul class="library-list" id="library-list"></ul>
+    <div class="library-tools" aria-label="Library and backup tools">
+      <button type="button" id="library-remove-unused">Remove unused songs</button>
+      <button type="button" id="backup-export">Export backup</button>
+      <button type="button" id="backup-restore">Restore backup</button>
+      <input type="file" id="backup-file" accept="application/json,.json" class="visually-hidden"
+        tabindex="-1" aria-describedby="backup-help library-status" />
+    </div>
+    <p class="library-help" id="backup-help">Restore replaces this browser's library, setlists, settings, and interface preferences.</p>
+    <p class="library-status" id="library-status" role="status" aria-live="polite"></p>
+  </dialog>
 `;
 
 const $ = <T extends HTMLElement>(id: string): T =>
@@ -210,9 +256,13 @@ const $ = <T extends HTMLElement>(id: string): T =>
 const bpmValue = $<HTMLSpanElement>("bpm-value");
 const bpmSlider = $<HTMLInputElement>("bpm-slider");
 const startStop = $<HTMLButtonElement>("startstop");
+const mobileStartStop = $<HTMLButtonElement>("mobile-startstop");
+const mobileBpmValue = $<HTMLSpanElement>("mobile-bpm-value");
 const lampsEl = $<HTMLDivElement>("lamps");
 const srStatus = $<HTMLParagraphElement>("sr-status");
 const trainerStatus = $<HTMLParagraphElement>("trainer-status");
+const singleKeyShortcuts = $<HTMLInputElement>("single-key-shortcuts");
+const singleKeyShortcutLegend = $<HTMLSpanElement>("single-key-shortcut-legend");
 
 function persist(): void {
   saveLastSettings(settings);
@@ -223,6 +273,7 @@ function persist(): void {
 function setBpm(bpm: number): void {
   settings.bpm = clampBpm(bpm);
   bpmValue.textContent = String(settings.bpm);
+  mobileBpmValue.textContent = String(settings.bpm);
   bpmSlider.value = String(settings.bpm);
   persist();
 }
@@ -234,6 +285,20 @@ $("tap").addEventListener("click", () => {
   const bpm = tapTempo.tap(performance.now());
   if (bpm !== null) setBpm(bpm);
 });
+
+function renderShortcutPreference(): void {
+  singleKeyShortcutLegend.hidden = !ui.singleKeyShortcutsEnabled;
+  if (ui.singleKeyShortcutsEnabled) $("tap").setAttribute("aria-keyshortcuts", "T");
+  else $("tap").removeAttribute("aria-keyshortcuts");
+}
+
+singleKeyShortcuts.addEventListener("change", () => {
+  ui.singleKeyShortcutsEnabled = singleKeyShortcuts.checked;
+  saveUiState(ui);
+  renderShortcutPreference();
+  announce(`Single-key shortcuts ${ui.singleKeyShortcutsEnabled ? "enabled" : "disabled"}`);
+});
+renderShortcutPreference();
 
 /* ---------- Beat lamps ---------- */
 
@@ -327,11 +392,14 @@ $<HTMLInputElement>("master").addEventListener("input", (e) => {
 function bindNumber(id: string, apply: (n: number) => void): void {
   $<HTMLInputElement>(id).addEventListener("change", (e) => {
     const el = e.target as HTMLInputElement;
-    const n = Number(el.value);
-    if (Number.isFinite(n)) {
-      apply(n);
-      persist();
-    }
+    const minimum = Number(el.min);
+    const maximum = Number(el.max);
+    const parsed = Number(el.value);
+    const finite = Number.isFinite(parsed) ? parsed : minimum;
+    const corrected = Math.round(Math.min(maximum, Math.max(minimum, finite)));
+    el.value = String(corrected);
+    apply(corrected);
+    persist();
   });
 }
 
@@ -358,9 +426,28 @@ const songEmpty = $<HTMLParagraphElement>("song-empty");
 const songTitle = $<HTMLInputElement>("song-title");
 const songArtist = $<HTMLInputElement>("song-artist");
 const songBand = $<HTMLInputElement>("song-band");
+const songUpdate = $<HTMLButtonElement>("song-update");
 const faceTransport = $<HTMLDivElement>("face-transport");
 const transportNow = $<HTMLParagraphElement>("transport-now");
 const transportNext = $<HTMLParagraphElement>("transport-next");
+const mobileTransportNow = $<HTMLParagraphElement>("mobile-transport-now");
+const mobileTransportNext = $<HTMLParagraphElement>("mobile-transport-next");
+const previousSongButtons = [
+  $<HTMLButtonElement>("song-prev"),
+  $<HTMLButtonElement>("mobile-song-prev"),
+];
+const nextSongButtons = [
+  $<HTMLButtonElement>("song-next"),
+  $<HTMLButtonElement>("mobile-song-next"),
+];
+const libraryDialog = $<HTMLDialogElement>("library-dialog");
+const librarySearch = $<HTMLInputElement>("library-search");
+const libraryList = $<HTMLUListElement>("library-list");
+const libraryResultsSummary = $<HTMLParagraphElement>("library-results-summary");
+const libraryStatus = $<HTMLParagraphElement>("library-status");
+const removeUnusedButton = $<HTMLButtonElement>("library-remove-unused");
+const backupFile = $<HTMLInputElement>("backup-file");
+let libraryOpener: HTMLElement | null = null;
 
 function saveUi(): void {
   saveUiState(ui);
@@ -370,9 +457,16 @@ function activeSetlist(): Setlist | null {
   return setlists.find((s) => s.id === ui.activeSetlistId) ?? setlists[0] ?? null;
 }
 
+function clearSongEditor(): void {
+  songTitle.value = "";
+  songArtist.value = "";
+  songBand.value = "";
+}
+
 function setActiveSetlist(id: string | null): void {
   ui.activeSetlistId = id;
   ui.activeSongId = null;
+  clearSongEditor();
   saveUi();
   renderSetlists();
 }
@@ -391,30 +485,37 @@ function renderSetlists(): void {
     setlistSelect.appendChild(opt);
   }
   setlistSelect.disabled = setlists.length === 0;
+  $("setlist-rename").toggleAttribute("disabled", !active);
+  $("setlist-delete").toggleAttribute("disabled", !active);
   if (active) setlistSelect.value = active.id;
   renderSongs();
 }
 
+function activeSongReferences() {
+  return resolveSongReferences(activeSetlist(), library);
+}
+
 function activeSongs(): LibrarySong[] {
-  return resolveSongs(activeSetlist(), library);
+  return activeSongReferences().map(({ song }) => song);
 }
 
 function songLabel(song: LibrarySong): string {
-  return song.artist ? `${song.title} \u2014 ${song.artist}` : song.title;
+  return song.artist ? `${song.title} by ${song.artist}` : song.title;
 }
 
 function renderSongs(): void {
-  const songs = activeSongs();
+  const references = activeSongReferences();
+  const songs = references.map(({ song }) => song);
   songList.innerHTML = "";
   songEmpty.hidden = songs.length > 0;
-  songs.forEach((song, i) => {
+  references.forEach(({ song, sourceIndex }, displayIndex) => {
     const li = document.createElement("li");
     if (song.id === ui.activeSongId) li.classList.add("active");
 
     const load = document.createElement("button");
     load.type = "button";
     load.className = "song-load";
-    load.innerHTML = `<span class="song-order">${i + 1}</span>
+    load.innerHTML = `<span class="song-order">${displayIndex + 1}</span>
       <span class="song-main">
         <span class="song-title">${escapeHtml(song.title)}</span>
         ${song.artist ? `<span class="song-artist">${escapeHtml(song.artist)}</span>` : ""}
@@ -422,23 +523,30 @@ function renderSongs(): void {
       ${song.band ? `<span class="song-band">${escapeHtml(song.band)}</span>` : ""}
       <span class="preset-meta">${song.settings.bpm} BPM</span>`;
     load.setAttribute("aria-label", `Load song ${songLabel(song)}, ${song.settings.bpm} BPM`);
+    if (song.id === ui.activeSongId) load.setAttribute("aria-current", "true");
     load.addEventListener("click", () => loadSong(song));
 
     const up = document.createElement("button");
     up.type = "button";
     up.className = "song-move";
     up.textContent = "\u2191";
-    up.disabled = i === 0;
+    up.disabled = displayIndex === 0;
     up.setAttribute("aria-label", `Move ${song.title} up`);
-    up.addEventListener("click", () => moveSong(i, -1));
+    up.addEventListener("click", () => {
+      const previous = references[displayIndex - 1];
+      if (previous) moveSong(sourceIndex, previous.sourceIndex);
+    });
 
     const down = document.createElement("button");
     down.type = "button";
     down.className = "song-move";
     down.textContent = "\u2193";
-    down.disabled = i === songs.length - 1;
+    down.disabled = displayIndex === references.length - 1;
     down.setAttribute("aria-label", `Move ${song.title} down`);
-    down.addEventListener("click", () => moveSong(i, 1));
+    down.addEventListener("click", () => {
+      const next = references[displayIndex + 1];
+      if (next) moveSong(sourceIndex, next.sourceIndex);
+    });
 
     const del = document.createElement("button");
     del.type = "button";
@@ -448,36 +556,49 @@ function renderSongs(): void {
     del.addEventListener("click", () => {
       const active = activeSetlist();
       if (!active) return;
-      active.songIds.splice(i, 1);
-      if (ui.activeSongId === song.id) {
+      active.songIds.splice(sourceIndex, 1);
+      if (ui.activeSongId === song.id && !active.songIds.includes(song.id)) {
         ui.activeSongId = null;
+        clearSongEditor();
         saveUi();
       }
       saveSetlists(setlists);
       renderSongs();
+      announce(`Removed ${song.title} from the setlist`);
     });
 
     li.append(load, up, down, del);
     songList.appendChild(li);
   });
+  songUpdate.disabled = !songs.some((song) => song.id === ui.activeSongId);
   renderTransport(songs);
 }
 
 function renderTransport(songs: LibrarySong[]): void {
   faceTransport.hidden = songs.length === 0;
-  if (songs.length === 0) return;
-  const idx = songs.findIndex((s) => s.id === ui.activeSongId);
-  const current = idx >= 0 ? songs[idx] : null;
-  const next = idx < 0 ? songs[0] : songs[idx + 1] ?? null;
-  transportNow.textContent = current ? songLabel(current) : "No song loaded";
-  transportNext.textContent = next ? `Next: ${songLabel(next)}` : "End of setlist";
+  const index = songs.findIndex((song) => song.id === ui.activeSongId);
+  const current = index >= 0 ? songs[index] : null;
+  const next = index < 0 ? songs[0] ?? null : songs[index + 1] ?? null;
+  const currentText = current ? songLabel(current) : "No song loaded";
+  const nextText = next ? `Next: ${songLabel(next)}` : songs.length > 0 ? "End of setlist" : "No songs in setlist";
+  transportNow.textContent = currentText;
+  transportNext.textContent = nextText;
+  mobileTransportNow.textContent = currentText;
+  mobileTransportNext.textContent = nextText;
+  for (const button of previousSongButtons) {
+    button.disabled = songs.length === 0 || index === 0;
+  }
+  for (const button of nextSongButtons) {
+    button.disabled = songs.length === 0 || index === songs.length - 1;
+  }
 }
 
-function moveSong(index: number, delta: number): void {
+function moveSong(sourceIndex: number, targetSourceIndex: number): void {
   const ids = activeSetlist()?.songIds ?? [];
-  const target = index + delta;
-  if (target < 0 || target >= ids.length) return;
-  [ids[index], ids[target]] = [ids[target], ids[index]];
+  if (sourceIndex < 0 || targetSourceIndex < 0 || sourceIndex >= ids.length || targetSourceIndex >= ids.length) {
+    return;
+  }
+  [ids[sourceIndex], ids[targetSourceIndex]] = [ids[targetSourceIndex], ids[sourceIndex]];
   saveSetlists(setlists);
   renderSongs();
 }
@@ -488,6 +609,9 @@ function loadSong(song: LibrarySong): void {
   renderLamps();
   syncInputs();
   persist();
+  songTitle.value = song.title;
+  songArtist.value = song.artist;
+  songBand.value = song.band ?? "";
   ui.activeSongId = song.id;
   saveUi();
   renderSongs();
@@ -511,6 +635,146 @@ function stepSong(delta: number): void {
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
+
+function libraryReferenceCount(songId: string): number {
+  return setlists.reduce(
+    (count, setlist) => count + setlist.songIds.filter((id) => id === songId).length,
+    0,
+  );
+}
+
+function unusedLibrarySongs(): LibrarySong[] {
+  return library.filter((song) => libraryReferenceCount(song.id) === 0);
+}
+
+function setLibraryStatus(message: string): void {
+  libraryStatus.textContent = message;
+  announce(message);
+}
+
+function renderLibrary(): void {
+  const query = librarySearch.value.trim().toLocaleLowerCase();
+  const active = activeSetlist();
+  const matches = library.filter((song) =>
+    [song.title, song.artist, song.band ?? ""].some((value) =>
+      value.toLocaleLowerCase().includes(query),
+    ),
+  );
+  libraryList.innerHTML = "";
+  for (const song of matches) {
+    const references = libraryReferenceCount(song.id);
+    const item = document.createElement("li");
+    const details = document.createElement("div");
+    details.className = "library-song-details";
+    const title = document.createElement("strong");
+    title.textContent = song.title;
+    const secondary = document.createElement("span");
+    secondary.textContent = [song.artist, song.band].filter(Boolean).join(" / ") || "No artist or Band";
+    const meta = document.createElement("span");
+    meta.className = "preset-meta";
+    meta.textContent = `${song.settings.bpm} BPM, ${references} ${references === 1 ? "reference" : "references"}`;
+    details.append(title, secondary, meta);
+
+    const add = document.createElement("button");
+    add.type = "button";
+    add.textContent = "Add to setlist";
+    add.disabled = active?.songIds.includes(song.id) ?? false;
+    add.setAttribute("aria-label", `Add ${song.title} to setlist`);
+    if (add.disabled) add.title = "Already in the active setlist";
+    add.addEventListener("click", () => {
+      const target = ensureActiveSetlist();
+      if (target.songIds.includes(song.id)) return;
+      target.songIds.push(song.id);
+      saveSetlists(setlists);
+      saveUi();
+      renderSetlists();
+      renderLibrary();
+      setLibraryStatus(`Added ${song.title} to ${target.name}`);
+    });
+    item.append(details, add);
+    libraryList.appendChild(item);
+  }
+
+  libraryResultsSummary.textContent = matches.length === 0
+    ? query ? "No songs match this search." : "No songs are saved in the library."
+    : `${matches.length} ${matches.length === 1 ? "song" : "songs"}`;
+  const unusedCount = unusedLibrarySongs().length;
+  removeUnusedButton.disabled = unusedCount === 0;
+  removeUnusedButton.textContent = unusedCount === 0
+    ? "Remove unused songs"
+    : `Remove ${unusedCount} unused ${unusedCount === 1 ? "song" : "songs"}`;
+}
+
+$("library-open").addEventListener("click", (event) => {
+  libraryOpener = event.currentTarget as HTMLElement;
+  librarySearch.value = "";
+  libraryStatus.textContent = "";
+  renderLibrary();
+  libraryDialog.showModal();
+  librarySearch.focus();
+});
+
+$("library-close").addEventListener("click", () => libraryDialog.close());
+libraryDialog.addEventListener("close", () => {
+  libraryOpener?.focus();
+  libraryOpener = null;
+});
+librarySearch.addEventListener("input", renderLibrary);
+
+removeUnusedButton.addEventListener("click", () => {
+  const unused = unusedLibrarySongs();
+  if (unused.length === 0) return;
+  const label = `${unused.length} unused ${unused.length === 1 ? "song" : "songs"}`;
+  if (!window.confirm(`Remove ${label} from the library? This cannot be undone.`)) return;
+  const removedIds = new Set(unused.map((song) => song.id));
+  for (let index = library.length - 1; index >= 0; index -= 1) {
+    if (removedIds.has(library[index].id)) library.splice(index, 1);
+  }
+  if (ui.activeSongId && removedIds.has(ui.activeSongId)) {
+    ui.activeSongId = null;
+    clearSongEditor();
+    saveUi();
+  }
+  saveLibrary(library);
+  renderSetlists();
+  renderLibrary();
+  setLibraryStatus(`Removed ${label} from the library`);
+});
+
+$("backup-export").addEventListener("click", () => {
+  const payload = createBackupPayload();
+  const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `ggcoder-metronome-backup-${payload.exportedAt.slice(0, 10)}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  setLibraryStatus("Backup exported");
+});
+
+$("backup-restore").addEventListener("click", () => backupFile.click());
+backupFile.addEventListener("change", async () => {
+  const file = backupFile.files?.[0];
+  backupFile.value = "";
+  if (!file) return;
+  try {
+    const payload = parseBackupPayload(await file.text());
+    if (!window.confirm("Restore this backup? This replaces the current library, setlists, metronome settings, and interface preferences in this browser.")) {
+      setLibraryStatus("Restore canceled. Current local data was not changed.");
+      return;
+    }
+    restoreBackupPayload(payload);
+    setLibraryStatus("Backup restored. Reloading the metronome.");
+    window.location.reload();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "The backup could not be restored.";
+    const rollbackFailed = message.includes("could not be fully rolled back");
+    setLibraryStatus(rollbackFailed ? message : `${message} Current local data was not changed.`);
+  }
+});
 
 setlistSelect.addEventListener("change", () => setActiveSetlist(setlistSelect.value));
 
@@ -538,7 +802,7 @@ $("setlist-delete").addEventListener("click", () => {
   const active = activeSetlist();
   if (!active) return;
   const count = active.songIds.length;
-  if (!window.confirm(`Delete setlist "${active.name}"${count ? ` and its ${count} songs` : ""}? Songs stay in the library.`))
+  if (!window.confirm(`Delete setlist "${active.name}"${count ? ` and its ${count} song ${count === 1 ? "reference" : "references"}` : ""}? Songs stay in the library.`))
     return;
   setlists = setlists.filter((s) => s.id !== active.id);
   saveSetlists(setlists);
@@ -546,46 +810,65 @@ $("setlist-delete").addEventListener("click", () => {
   announce(`Deleted ${active.name}`);
 });
 
-$("song-save").addEventListener("click", () => {
-  let active = activeSetlist();
-  if (!active) {
-    active = { id: crypto.randomUUID(), name: "Setlist 1", songIds: [] };
-    setlists.push(active);
-    ui.activeSetlistId = active.id;
-  }
+function ensureActiveSetlist(): Setlist {
+  const current = activeSetlist();
+  if (current) return current;
+  const created = { id: crypto.randomUUID(), name: "Setlist 1", songIds: [] };
+  setlists.push(created);
+  ui.activeSetlistId = created.id;
+  return created;
+}
+
+function currentSongMetadata(): Pick<LibrarySong, "title" | "artist" | "band"> {
   const title = songTitle.value.trim() || `${settings.bpm} BPM`;
   const artist = songArtist.value.trim();
   const band = songBand.value.trim();
-  const existing = library.find((s) => s.title === title && s.artist === artist);
-  let song: LibrarySong;
-  if (existing) {
-    existing.settings = structuredClone(settings);
-    if (band) existing.band = band;
-    song = existing;
-  } else {
-    song = {
-      id: crypto.randomUUID(),
-      title,
-      artist,
-      ...(band ? { band } : {}),
-      settings: structuredClone(settings),
-    };
-    library.push(song);
-  }
-  if (!active.songIds.includes(song.id)) active.songIds.push(song.id);
+  return { title, artist, ...(band ? { band } : {}) };
+}
+
+$("song-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const active = ensureActiveSetlist();
+  const metadata = currentSongMetadata();
+  const song: LibrarySong = {
+    id: crypto.randomUUID(),
+    ...metadata,
+    settings: structuredClone(settings),
+  };
+  library.push(song);
+  active.songIds.push(song.id);
   ui.activeSongId = song.id;
+  songTitle.value = song.title;
+  songArtist.value = song.artist;
+  songBand.value = song.band ?? "";
   saveLibrary(library);
   saveSetlists(setlists);
   saveUi();
-  songTitle.value = "";
-  songArtist.value = "";
-  songBand.value = "";
   renderSetlists();
-  announce(`Saved ${title}`);
+  announce(`Saved new song ${song.title}`);
 });
 
-$("song-prev").addEventListener("click", () => stepSong(-1));
-$("song-next").addEventListener("click", () => stepSong(1));
+songUpdate.addEventListener("click", () => {
+  const loaded = library.find((song) => song.id === ui.activeSongId);
+  if (!loaded) return;
+  const previousTitle = loaded.title;
+  const metadata = currentSongMetadata();
+  loaded.title = metadata.title;
+  loaded.artist = metadata.artist;
+  if (metadata.band) loaded.band = metadata.band;
+  else delete loaded.band;
+  loaded.settings = structuredClone(settings);
+  saveLibrary(library);
+  renderSetlists();
+  announce(`Updated loaded song ${loaded.title}${loaded.title !== previousTitle ? `, previously ${previousTitle}` : ""}`);
+});
+
+for (const button of previousSongButtons) {
+  button.addEventListener("click", () => stepSong(-1));
+}
+for (const button of nextSongButtons) {
+  button.addEventListener("click", () => stepSong(1));
+}
 
 function syncInputs(): void {
   $<HTMLInputElement>("beats").value = String(settings.beatsPerBar);
@@ -604,6 +887,16 @@ function syncInputs(): void {
 }
 
 renderSetlists();
+const initiallyLoadedSong = activeSongs().find((song) => song.id === ui.activeSongId);
+if (initiallyLoadedSong) {
+  songTitle.value = initiallyLoadedSong.title;
+  songArtist.value = initiallyLoadedSong.artist;
+  songBand.value = initiallyLoadedSong.band ?? "";
+} else if (ui.activeSongId) {
+  ui.activeSongId = null;
+  saveUi();
+  renderSongs();
+}
 
 /* ---------- Collapsible pillars & panels ---------- */
 
@@ -665,23 +958,59 @@ function announce(msg: string): void {
   srStatus.textContent = msg;
 }
 
+function renderPlaybackState(running: boolean): void {
+  for (const button of [startStop, mobileStartStop]) {
+    button.textContent = running ? "Stop" : "Start";
+    button.setAttribute("aria-pressed", String(running));
+  }
+  if (!running) {
+    bpmValue.textContent = String(settings.bpm);
+    mobileBpmValue.textContent = String(settings.bpm);
+  }
+}
+
+let transportTransitioning = false;
+
 async function toggle(): Promise<void> {
-  if (engine.running) {
-    engine.stop();
-    startStop.textContent = "Start";
-    startStop.setAttribute("aria-pressed", "false");
-    trainerStatus.textContent = "";
-    announce("Stopped");
-    clearLamps();
-  } else {
-    await engine.start();
-    startStop.textContent = "Stop";
-    startStop.setAttribute("aria-pressed", "true");
-    announce("Started");
+  if (transportTransitioning) return;
+  transportTransitioning = true;
+  startStop.disabled = true;
+  mobileStartStop.disabled = true;
+  try {
+    if (engine.running) {
+      engine.stop();
+      renderPlaybackState(false);
+      trainerStatus.textContent = "";
+      announce("Stopped");
+      clearLamps();
+      return;
+    }
+
+    try {
+      await engine.start();
+      renderPlaybackState(true);
+      announce("Started");
+    } catch {
+      engine.stop();
+      renderPlaybackState(false);
+      trainerStatus.textContent = "Audio could not start. Check browser audio permissions and try again.";
+      announce("Audio could not start. Check browser audio permissions, then press Start to retry.");
+      clearLamps();
+    }
+  } finally {
+    transportTransitioning = false;
+    startStop.disabled = false;
+    mobileStartStop.disabled = false;
   }
 }
 
 startStop.addEventListener("click", () => void toggle());
+mobileStartStop.addEventListener("click", () => void toggle());
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  engine.resync();
+  clearLamps();
+});
 
 function clearLamps(): void {
   lampsEl.querySelectorAll(".lamp").forEach((l) => l.classList.remove("lit", "lit-muted"));
@@ -696,6 +1025,7 @@ function tick(): void {
     lamp?.classList.add(latest.muted ? "lit-muted" : "lit");
     if (latest.bpm !== Number(bpmValue.textContent)) {
       bpmValue.textContent = String(latest.bpm);
+      mobileBpmValue.textContent = String(latest.bpm);
     }
     const parts: string[] = [`Bar ${latest.bar + 1}`];
     if (settings.gap.enabled) parts.push(latest.muted ? "gap: silent, keep counting" : "gap: playing");
@@ -710,6 +1040,7 @@ requestAnimationFrame(tick);
 /* ---------- Keyboard shortcuts ---------- */
 
 document.addEventListener("keydown", (e) => {
+  if (libraryDialog.open) return;
   const target = e.target as HTMLElement;
   const typing =
     target instanceof HTMLInputElement || target instanceof HTMLSelectElement;
@@ -717,7 +1048,7 @@ document.addEventListener("keydown", (e) => {
   switch (e.key) {
     case " ":
       if (typing) return;
-      if (target instanceof HTMLButtonElement && target !== startStop) return;
+      if (target instanceof HTMLButtonElement && target !== startStop && target !== mobileStartStop) return;
       e.preventDefault();
       void toggle();
       break;
@@ -743,19 +1074,19 @@ document.addEventListener("keydown", (e) => {
       break;
     case "t":
     case "T": {
-      if (typing) return;
+      if (typing || !ui.singleKeyShortcutsEnabled) return;
       const bpm = tapTempo.tap(performance.now());
       if (bpm !== null) setBpm(bpm);
       break;
     }
     case "n":
     case "N":
-      if (typing) return;
+      if (typing || !ui.singleKeyShortcutsEnabled) return;
       stepSong(1);
       break;
     case "p":
     case "P":
-      if (typing) return;
+      if (typing || !ui.singleKeyShortcutsEnabled) return;
       stepSong(-1);
       break;
   }

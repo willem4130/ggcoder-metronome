@@ -1,14 +1,23 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { MAX_BPM } from "./timing";
 import {
+  createBackupPayload,
   defaultSettings,
   defaultUiState,
+  loadLastSettings,
   loadLibrary,
   loadSetlists,
   loadUiState,
+  normalizeSettings,
+  parseBackupPayload,
+  resolveSongReferences,
   resolveSongs,
+  restoreBackupPayload,
+  saveLastSettings,
   saveLibrary,
   saveSetlists,
   saveUiState,
+  type BackupPayload,
   type LibrarySong,
   type Preset,
   type Setlist,
@@ -16,9 +25,11 @@ import {
 } from "./state";
 
 const PRESETS_KEY = "ggcoder-metronome.presets.v1";
+const LAST_KEY = "ggcoder-metronome.last.v1";
 const SETLISTS_V1_KEY = "ggcoder-metronome.setlists.v1";
 const SETLISTS_KEY = "ggcoder-metronome.setlists.v2";
 const LIBRARY_KEY = "ggcoder-metronome.library.v1";
+const UI_KEY = "ggcoder-metronome.ui.v1";
 
 /** Minimal in-memory localStorage so tests run without a DOM environment. */
 function stubLocalStorage(): void {
@@ -229,5 +240,186 @@ describe("UI state round-trip", () => {
     saveUiState(ui);
 
     expect(loadUiState()).toEqual(ui);
+  });
+});
+
+describe("deep persisted-data normalization", () => {
+  it("repairs malformed nested settings and clamps every finite range", () => {
+    localStorage.setItem(
+      LAST_KEY,
+      JSON.stringify({
+        bpm: 999,
+        beatsPerBar: 3,
+        accents: ["mute", "invalid"],
+        mix: { quarter: -4, eighth: 0.4, sixteenth: 7, triplet: "loud" },
+        voice: "noise",
+        masterVolume: -1,
+        gap: { enabled: "yes", playBars: 99, muteBars: 0 },
+        speed: { enabled: true, toBpm: 999, stepBpm: 99, everyBars: -2 },
+      }),
+    );
+
+    expect(loadLastSettings()).toEqual({
+      bpm: MAX_BPM,
+      beatsPerBar: 3,
+      accents: ["mute", "normal", "normal"],
+      mix: { quarter: 0, eighth: 0.4, sixteenth: 1, triplet: 0 },
+      voice: "click",
+      masterVolume: 0,
+      gap: { enabled: false, playBars: 32, muteBars: 1 },
+      speed: { enabled: true, toBpm: MAX_BPM, stepBpm: 20, everyBars: 1 },
+    });
+  });
+
+  it("uses nested defaults instead of shallow-merging partial objects", () => {
+    const normalized = normalizeSettings({
+      bpm: 90,
+      mix: { eighth: 0.5 },
+      gap: { enabled: true },
+      speed: { toBpm: 140 },
+    });
+
+    expect(normalized.mix).toEqual({ quarter: 1, eighth: 0.5, sixteenth: 0, triplet: 0 });
+    expect(normalized.gap).toEqual({ enabled: true, playBars: 4, muteBars: 2 });
+    expect(normalized.speed).toEqual({ enabled: false, toBpm: 140, stepBpm: 2, everyBars: 4 });
+    expect(normalized.accents).toEqual(defaultSettings().accents);
+  });
+
+  it("drops malformed records but preserves valid dangling song references", () => {
+    localStorage.setItem(
+      LIBRARY_KEY,
+      JSON.stringify([
+        { id: "", title: "Missing id", settings: defaultSettings() },
+        { id: "valid", title: " Valid ", artist: 42, settings: { bpm: 92 } },
+        "not a song",
+      ]),
+    );
+    localStorage.setItem(
+      SETLISTS_KEY,
+      JSON.stringify([{ id: "sl", name: " Gig ", songIds: ["valid", "dangling", 12] }]),
+    );
+
+    expect(loadLibrary()).toEqual([
+      { id: "valid", title: "Valid", artist: "", settings: { ...defaultSettings(), bpm: 92 } },
+    ]);
+    expect(loadSetlists()).toEqual([{ id: "sl", name: "Gig", songIds: ["valid", "dangling"] }]);
+  });
+});
+
+describe("active-id-preserving migration", () => {
+  it("chooses the active duplicate id as canonical during dedupe", () => {
+    const shared = { ...defaultSettings(), bpm: 101 };
+    const v1: SetlistV1[] = [
+      { id: "one", name: "One", songs: [{ id: "first", name: "Shared", settings: shared }] },
+      { id: "two", name: "Two", songs: [{ id: "active", name: "Shared", settings: shared }] },
+    ];
+    localStorage.setItem(SETLISTS_V1_KEY, JSON.stringify(v1));
+    localStorage.setItem(
+      UI_KEY,
+      JSON.stringify({ ...defaultUiState(), activeSetlistId: "two", activeSongId: "active" }),
+    );
+
+    expect(loadSetlists().map((setlist) => setlist.songIds)).toEqual([["active"], ["active"]]);
+    expect(loadLibrary().map((song) => song.id)).toEqual(["active"]);
+    expect(loadUiState().activeSongId).toBe("active");
+  });
+});
+
+describe("resolved song source indexes", () => {
+  it("retains exact source indexes around dangling ids", () => {
+    const library = [librarySong({ id: "a" }), librarySong({ id: "b" })];
+    const setlist: Setlist = {
+      id: "sl",
+      name: "Gig",
+      songIds: ["gone-first", "b", "gone-middle", "a"],
+    };
+
+    expect(resolveSongReferences(setlist, library)).toEqual([
+      { song: library[1], sourceIndex: 1 },
+      { song: library[0], sourceIndex: 3 },
+    ]);
+  });
+});
+
+describe("versioned backups", () => {
+  function validBackup(): BackupPayload {
+    saveLibrary([librarySong({ id: "song", title: "Opener" })]);
+    saveSetlists([{ id: "set", name: "Show", songIds: ["song"] }]);
+    saveLastSettings({ ...defaultSettings(), bpm: 96 });
+    saveUiState({ ...defaultUiState(), activeSetlistId: "set", activeSongId: "song" });
+    return createBackupPayload();
+  }
+
+  it("creates and parses a complete version 1 payload", () => {
+    const backup = validBackup();
+    const parsed = parseBackupPayload(JSON.stringify(backup));
+
+    expect(parsed.version).toBe(1);
+    expect(parsed.library[0].title).toBe("Opener");
+    expect(parsed.setlists[0].songIds).toEqual(["song"]);
+    expect(parsed.lastSettings.bpm).toBe(96);
+    expect(parsed.ui.activeSongId).toBe("song");
+  });
+
+  it("rejects malformed JSON and malformed valid-JSON data", () => {
+    expect(() => parseBackupPayload("{"))
+      .toThrow("not valid JSON");
+    expect(() => parseBackupPayload(JSON.stringify({ version: 2 })))
+      .toThrow("version is not supported");
+
+    const malformed = {
+      ...validBackup(),
+      lastSettings: { ...defaultSettings(), gap: { enabled: true } },
+    };
+    expect(() => parseBackupPayload(JSON.stringify(malformed)))
+      .toThrow("invalid metronome settings");
+  });
+
+  it("restores all current keys after validation", () => {
+    const backup = validBackup();
+    localStorage.clear();
+
+    restoreBackupPayload(parseBackupPayload(JSON.stringify(backup)));
+
+    expect(loadLibrary()[0].id).toBe("song");
+    expect(loadSetlists()[0].id).toBe("set");
+    expect(loadLastSettings().bpm).toBe(96);
+    expect(loadUiState().activeSongId).toBe("song");
+  });
+
+  it("rolls back every key when a storage write fails", () => {
+    const backup = validBackup();
+    const previous = new Map<string, string>([
+      [LIBRARY_KEY, "old-library"],
+      [SETLISTS_KEY, "old-setlists"],
+      [LAST_KEY, "old-settings"],
+      [UI_KEY, "old-ui"],
+    ]);
+    let didFail = false;
+    const failingStorage = {
+      getItem: (key: string) => previous.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        if (key === LAST_KEY && !didFail) {
+          didFail = true;
+          throw new Error("quota");
+        }
+        previous.set(key, value);
+      },
+      removeItem: (key: string) => void previous.delete(key),
+      clear: () => previous.clear(),
+      key: (index: number) => [...previous.keys()][index] ?? null,
+      get length() {
+        return previous.size;
+      },
+    } as Storage;
+
+    expect(() => restoreBackupPayload(backup, failingStorage))
+      .toThrow("previous local data was preserved");
+    expect(Object.fromEntries(previous)).toEqual({
+      [LIBRARY_KEY]: "old-library",
+      [SETLISTS_KEY]: "old-setlists",
+      [LAST_KEY]: "old-settings",
+      [UI_KEY]: "old-ui",
+    });
   });
 });
