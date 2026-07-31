@@ -413,7 +413,7 @@ app.innerHTML = `
       <input type="file" id="backup-file" accept="application/json,.json" class="visually-hidden"
         tabindex="-1" aria-describedby="backup-help library-status" />
     </div>
-    <p class="library-help" id="backup-help">Restore replaces this browser's library, setlists, settings, and interface preferences.</p>
+    <p class="library-help" id="backup-help">Restore replaces this browser's library, setlists, settings, interface preferences, and Timing Lab history.</p>
     <p class="library-status" id="library-status" role="status" aria-live="polite"></p>
   </dialog>
 `;
@@ -451,6 +451,7 @@ const analysisExport = $<HTMLButtonElement>("analysis-export");
 const analysisGrid = $<HTMLSelectElement>("analysis-grid");
 const analysisSensitivity = $<HTMLSelectElement>("analysis-sensitivity");
 const analysisOffset = $<HTMLInputElement>("analysis-offset");
+const analysisCalibrate = $<HTMLButtonElement>("analysis-calibrate");
 const analysisLevel = $<HTMLMeterElement>("analysis-level");
 const analysisDevice = $<HTMLParagraphElement>("analysis-device");
 const analysisCalibrationStatus = $<HTMLParagraphElement>("analysis-calibration-status");
@@ -488,6 +489,8 @@ function setAnalysisState(state: AnalysisUiState, message: string): void {
   analysisMessage.textContent = message;
   const pending = state === "requesting-permission" || state === "warming-up" || state === "calibration";
   analysisToggle.disabled = pending || state === "unsupported";
+  analysisReset.disabled = pending;
+  analysisCalibrate.disabled = pending || state === "unsupported";
   analysisToggle.textContent = state === "live" || state === "warming-up"
     ? "End and save"
     : "Start analysis";
@@ -585,7 +588,10 @@ function renderAnalysisHistory(): void {
     const metadata = document.createElement("span");
     metadata.textContent = `${new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(record.recordedAt))} · ${record.hitCount} hits · ${record.playedBpm?.toFixed(1) ?? "--"} BPM`;
     const trend = document.createElement("small");
-    trend.textContent = comparableTrend(record, index);
+    const pulseName = record.subdivision === 1 ? "quarter" : record.subdivision === 2 ? "eighth" : "sixteenth";
+    const modeName = record.mode === "metronome" ? "Metronome sync" : "Free play";
+    metadata.textContent = `${metadata.textContent} · ${modeName} · ${pulseName} pulse`;
+    trend.textContent = `${comparableTrend(record, index)} · Mean ${formatMilliseconds(record.meanAbsoluteErrorMs)} · Jitter ${formatMilliseconds(record.jitterMs)}`;
     summary.append(title, metadata, trend);
     const score = document.createElement("strong");
     score.className = "history-score";
@@ -690,6 +696,14 @@ const microphoneAnalyzer = new MicrophoneAnalyzer(engine, {
   },
   onUnexpectedStop: (message) => {
     stopAnalysisTimer();
+    if (calibrationController?.running) {
+      if (calibrationTimer !== null) window.clearTimeout(calibrationTimer);
+      calibrationTimer = null;
+      calibrationController.cancel();
+      calibrationStatus.textContent = message;
+      calibrationBegin.disabled = false;
+      calibrationBegin.textContent = "Retry measurement";
+    }
     const state = message.toLowerCase().includes("disconnect") ? "disconnected" : "processing-error";
     setAnalysisState(state, message);
   },
@@ -807,7 +821,7 @@ function exportAnalysisCsv(): void {
   anchor.href = url;
   anchor.download = `ggcoder-timing-sessions-${new Date().toISOString().slice(0, 10)}.csv`;
   anchor.click();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 analysisExport.addEventListener("click", exportAnalysisCsv);
 
@@ -830,7 +844,9 @@ calibrationBegin.addEventListener("click", async () => {
   calibrationStatus.textContent = "Requesting microphone access, then scheduling ten clicks.";
   setAnalysisState("calibration", "Calibration is using the microphone and speaker loopback.");
   try {
-    const run = await calibrationController.begin(lastInputStatus?.latencySeconds ?? null);
+    const run = await calibrationController.begin(
+      () => lastInputStatus?.latencySeconds ?? null,
+    );
     calibrationStatus.textContent = `Listening for ${CALIBRATION_CLICK_COUNT} clicks. Do not play.`;
     calibrationProgress.style.transitionDuration = `${CALIBRATION_CLICK_INTERVAL_SECONDS * (CALIBRATION_CLICK_COUNT - 1) + 1}s`;
     requestAnimationFrame(() => { calibrationProgress.style.inlineSize = "100%"; });
@@ -858,10 +874,17 @@ calibrationBegin.addEventListener("click", async () => {
       calibrationBegin.textContent = "Retry measurement";
     }, (0.5 + CALIBRATION_CLICK_INTERVAL_SECONDS * (CALIBRATION_CLICK_COUNT - 1) + 0.6) * 1_000);
   } catch (error) {
-    calibrationStatus.textContent = microphoneErrorMessage(error);
-    calibrationBegin.disabled = false;
-    calibrationBegin.textContent = "Retry measurement";
-    setAnalysisState("processing-error", "Calibration could not start. Check the microphone and retry.");
+    const message = microphoneErrorMessage(error);
+    const denied = error instanceof DOMException
+      && (error.name === "NotAllowedError" || error.name === "SecurityError");
+    const unsupported = message.includes("HTTPS") || message.includes("AudioWorklet");
+    calibrationStatus.textContent = message;
+    calibrationBegin.disabled = unsupported;
+    calibrationBegin.textContent = unsupported ? "Calibration unavailable" : "Retry measurement";
+    setAnalysisState(
+      unsupported ? "unsupported" : denied ? "denied" : "processing-error",
+      "Calibration could not start. Check the microphone guidance and retry.",
+    );
   }
 });
 
@@ -877,8 +900,19 @@ navigator.mediaDevices?.addEventListener?.("devicechange", () => {
   analysisPreferences.calibration = markCalibrationForDevice(analysisPreferences.calibration, null);
   saveAnalysisPreferences(analysisPreferences);
   renderCalibrationStatus();
-  if (microphoneAnalyzer.running) {
+  const calibrationWasRunning = calibrationController.running;
+  const analysisWasRunning = microphoneAnalyzer.running;
+  if (calibrationWasRunning) {
+    if (calibrationTimer !== null) window.clearTimeout(calibrationTimer);
+    calibrationTimer = null;
+    calibrationController.cancel();
+    calibrationStatus.textContent = "The audio-device list changed. Reconnect the microphone, then retry calibration.";
+    calibrationBegin.disabled = false;
+    calibrationBegin.textContent = "Retry measurement";
+  } else if (analysisWasRunning) {
     microphoneAnalyzer.stop();
+  }
+  if (calibrationWasRunning || analysisWasRunning) {
     stopAnalysisTimer();
     setAnalysisState("disconnected", "The audio-device list changed. Reconnect or select the microphone, then retry.");
   }
@@ -1409,7 +1443,7 @@ $("backup-export").addEventListener("click", () => {
   document.body.appendChild(link);
   link.click();
   link.remove();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
   setLibraryStatus("Backup exported");
 });
 
@@ -1420,7 +1454,7 @@ backupFile.addEventListener("change", async () => {
   if (!file) return;
   try {
     const payload = parseBackupPayload(await file.text());
-    if (!window.confirm("Restore this backup? This replaces the current library, setlists, metronome settings, and interface preferences in this browser.")) {
+    if (!window.confirm("Restore this backup? This replaces the current library, setlists, metronome settings, interface preferences, and Timing Lab history in this browser.")) {
       setLibraryStatus("Restore canceled. Current local data was not changed.");
       return;
     }
@@ -1705,7 +1739,7 @@ requestAnimationFrame(tick);
 /* ---------- Keyboard shortcuts ---------- */
 
 document.addEventListener("keydown", (e) => {
-  if (libraryDialog.open) return;
+  if (libraryDialog.open || calibrationDialog.open) return;
   const target = e.target as HTMLElement;
   const typing =
     target instanceof HTMLInputElement || target instanceof HTMLSelectElement;

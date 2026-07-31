@@ -1221,7 +1221,7 @@ input[type="range"]::-moz-range-thumb {
 }
 
 .analysis-history li button {
-  min-height: 36px;
+  min-height: 44px;
   padding-inline: 10px;
   font-size: 0.7rem;
 }

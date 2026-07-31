@@ -664,6 +664,11 @@ async function assertCalibrationWorkflow(browser) {
       localStorage.getItem("ggcoder-metronome.analysis.preferences.v1"),
     ));
     assert.equal(saved.calibration.quality, "measured");
+    await page.evaluate(() => navigator.mediaDevices.dispatchEvent(new Event("devicechange")));
+    const stale = await page.evaluate(() => JSON.parse(
+      localStorage.getItem("ggcoder-metronome.analysis.preferences.v1"),
+    ));
+    assert.equal(stale.calibration.stale, true, "Device change did not stale measured calibration");
 
     await page.click("#calibration-begin");
     await page.clock.fastForward((10 * CALIBRATION_CLICK_INTERVAL_SECONDS + 1) * 1000);

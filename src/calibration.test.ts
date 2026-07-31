@@ -102,6 +102,7 @@ describe("CalibrationController lifecycle", () => {
     const { controller, host } = harness(() => pendingCapture);
     const starting = controller.begin(null);
     await Promise.resolve();
+    expect(controller.running).toBe(true);
     controller.cancel();
     resolveCapture();
     await expect(starting).rejects.toThrow("cancelled");

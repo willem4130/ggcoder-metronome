@@ -145,6 +145,7 @@ export function markCalibrationForDevice(
 export class CalibrationController {
   private contextLeased = false;
   private active = false;
+  private starting = false;
   private cancelled = false;
   private referenceTimes: number[] = [];
   private onsetTimes: number[] = [];
@@ -155,15 +156,18 @@ export class CalibrationController {
   ) {}
 
   get running(): boolean {
-    return this.active;
+    return this.active || this.starting;
   }
 
-  async begin(inputLatencySeconds: number | null): Promise<CalibrationRun> {
-    if (this.active) throw new Error("Calibration is already running.");
+  async begin(
+    inputLatencySeconds: number | null | (() => number | null),
+  ): Promise<CalibrationRun> {
+    if (this.running) throw new Error("Calibration is already running.");
     if (this.audioHost.running) {
       throw new Error("Stop metronome playback before calibrating.");
     }
     this.cancelled = false;
+    this.starting = true;
     this.referenceTimes = [];
     this.onsetTimes = [];
     try {
@@ -178,10 +182,14 @@ export class CalibrationController {
         this.referenceTimes.push(time);
         this.audioHost.scheduleCalibrationClick(time);
       }
+      this.starting = false;
       this.active = true;
+      const resolvedInputLatency = typeof inputLatencySeconds === "function"
+        ? inputLatencySeconds()
+        : inputLatencySeconds;
       return {
         referenceTimes: [...this.referenceTimes],
-        estimatedOffsetMs: estimateDeviceOffsetMs(context, inputLatencySeconds),
+        estimatedOffsetMs: estimateDeviceOffsetMs(context, resolvedInputLatency),
       };
     } catch (error) {
       this.cleanup();
@@ -208,6 +216,7 @@ export class CalibrationController {
 
   private cleanup(): void {
     this.active = false;
+    this.starting = false;
     this.capture.stop();
     if (this.contextLeased) {
       this.contextLeased = false;
