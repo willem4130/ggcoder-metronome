@@ -1,8 +1,23 @@
 import "./style.css";
 import { MetronomeEngine } from "./engine";
 import {
+  MicrophoneAnalyzer,
+  microphoneErrorMessage,
+  type MicrophoneInputStatus,
+} from "./microphone-analyzer";
+import { TimingAnalysisSession, type AnalysisSnapshot } from "./performance-analysis";
+import {
+  CALIBRATION_CLICK_COUNT,
+  CALIBRATION_CLICK_INTERVAL_SECONDS,
+  CalibrationController,
+  markCalibrationForDevice,
+} from "./calibration";
+import {
   createBackupPayload,
   defaultAccents,
+  deleteAnalysisSession,
+  loadAnalysisHistory,
+  loadAnalysisPreferences,
   loadLastSettings,
   loadLibrary,
   loadSetlists,
@@ -10,10 +25,16 @@ import {
   parseBackupPayload,
   resolveSongReferences,
   restoreBackupPayload,
+  saveAnalysisPreferences,
+  saveAnalysisSession,
   saveLastSettings,
   saveLibrary,
   saveSetlists,
   saveUiState,
+  type AnalysisMode,
+  type AnalysisSensitivity,
+  type AnalysisSessionRecord,
+  type AnalysisSubdivision,
   type BeatAccent,
   type LibrarySong,
   type Setlist,
@@ -29,18 +50,39 @@ const library: LibrarySong[] = loadLibrary();
 const ui: UiState = loadUiState();
 const engine = new MetronomeEngine(() => settings);
 const tapTempo = new TapTempo();
+let analysisPreferences = loadAnalysisPreferences();
+const analysisSession = new TimingAnalysisSession("free", analysisPreferences);
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `
-  <header class="shell">
-    <h1>GGCoder Metronome<span class="subtitle">drummer's metronome</span></h1>
+  <header class="app-header">
+    <div class="shell header-inner">
+      <div class="brand-lockup">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        <div>
+          <h1>GGCoder Metronome</h1>
+          <p>Practice console</p>
+        </div>
+      </div>
+      <div class="workspace-status" aria-label="Workspace storage status">
+        <span class="workspace-status-dot" aria-hidden="true"></span>
+        <span><strong>Local workspace</strong><small>Auto-saved in this browser</small></span>
+      </div>
+    </div>
   </header>
-  <main class="shell" id="main-shell">
+  <main class="shell workspace" id="main-shell">
     <div class="pillar pillar-metronome">
-    <section class="panel tempo" aria-label="Tempo">
+    <section class="panel tempo" aria-labelledby="tempo-heading">
+      <div class="tempo-heading">
+        <div>
+          <p class="section-kicker">Performance engine</p>
+          <h2 id="tempo-heading">Tempo</h2>
+        </div>
+        <span class="engine-state" id="engine-state" aria-live="polite">Ready</span>
+      </div>
       <p class="bpm-readout" id="bpm-readout" aria-live="off">
         <span id="bpm-value">${settings.bpm}</span>
-        <span class="bpm-label" id="bpm-label">BPM</span>
+        <span class="bpm-unit"><span class="bpm-label" id="bpm-label">BPM</span><small>${MIN_BPM}-${MAX_BPM}</small></span>
       </p>
       <div class="tempo-row">
         <button type="button" id="bpm-down" aria-label="Decrease tempo">&minus;</button>
@@ -69,6 +111,110 @@ app.innerHTML = `
     </section>
     </div>
 
+    <section class="panel analysis-panel" id="analysis-panel" aria-labelledby="analysis-heading">
+      <div class="analysis-heading">
+        <div>
+          <p class="section-kicker">Timing lab</p>
+          <h2 id="analysis-heading">Performance analysis</h2>
+        </div>
+        <span class="analysis-state" id="analysis-state" data-state="idle">Mic off</span>
+      </div>
+      <div class="analysis-layout">
+        <div class="analysis-setup">
+          <p class="analysis-intro">Measure pulse, timing spread, and early or late bias from live playing.</p>
+          <div class="analysis-mode-row">
+            <span class="analysis-mode-label">Analysis mode</span>
+            <strong id="analysis-mode">Free play</strong>
+            <small id="analysis-mode-help">Tempo is inferred from a steady repeated pulse.</small>
+          </div>
+          <div class="analysis-actions">
+            <button type="button" class="btn-primary" id="analysis-toggle">Start analysis</button>
+            <button type="button" id="analysis-reset">Reset</button>
+            <button type="button" id="analysis-export" disabled>Export CSV</button>
+          </div>
+          <div class="analysis-preferences">
+            <div class="field">
+              <label for="analysis-grid">Played pulse</label>
+              <select id="analysis-grid">
+                <option value="1">Quarter notes</option>
+                <option value="2">Eighth notes</option>
+                <option value="4">Sixteenth notes</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="analysis-sensitivity">Input sensitivity</label>
+              <select id="analysis-sensitivity" aria-describedby="analysis-sensitivity-help">
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+              </select>
+              <small id="analysis-sensitivity-help">Higher catches quieter hits but may add false detections.</small>
+            </div>
+            <div class="field offset-field">
+              <label for="analysis-offset">Input offset (ms)</label>
+              <input type="number" id="analysis-offset" min="-250" max="250" step="1" aria-describedby="analysis-calibration-status" />
+            </div>
+            <button type="button" id="analysis-calibrate">Calibrate device</button>
+            <button type="button" id="analysis-calibration-reset">Reset offset</button>
+          </div>
+          <div class="input-monitor">
+            <span>Input</span>
+            <meter id="analysis-level" min="0" max="1" value="0">0%</meter>
+          </div>
+          <p class="analysis-device" id="analysis-device">Microphone details appear when a session starts.</p>
+          <p class="analysis-device" id="analysis-calibration-status"></p>
+          <p class="analysis-advice"><strong>Use headphones for scored sessions.</strong> Speaker bleed can look like a perfectly timed hit. Free play requires a steady selected pulse; ambient sound can add false hits.</p>
+          <p class="analysis-privacy">Microphone audio is processed live on this device. It is not recorded, stored, or uploaded.</p>
+          <details class="analysis-help"><summary>How the score works</summary><p>Score = 100 × (1 − RMS timing error ÷ 20% of the selected pulse duration), clamped from 0 to 100. Millisecond error and jitter are the primary results.</p></details>
+        </div>
+
+        <div class="analysis-results" aria-label="Live timing results">
+          <div class="analysis-hero-metrics">
+            <div class="score-card">
+              <span>Timing score</span>
+              <strong id="analysis-score">--</strong>
+              <small id="analysis-grade">Collecting</small>
+            </div>
+            <div class="metric-card">
+              <span>Played tempo</span>
+              <strong><span id="analysis-bpm">--</span><small> BPM</small></strong>
+              <small id="analysis-confidence">0% confidence</small>
+            </div>
+            <div class="metric-card">
+              <span id="analysis-deviation-label">Interval change</span>
+              <strong id="analysis-deviation">--</strong>
+            </div>
+          </div>
+          <div class="analysis-detail-grid">
+            <div><span>Mean error</span><strong id="analysis-mean">--</strong></div>
+            <div><span>Jitter</span><strong id="analysis-jitter">--</strong></div>
+            <div><span id="analysis-bias-label">Interval bias</span><strong id="analysis-bias">--</strong></div>
+            <div><span>Analyzed</span><strong id="analysis-hits">0 hits</strong></div>
+            <div><span>Session</span><strong id="analysis-duration">0:00</strong></div>
+          </div>
+          <div class="timing-trace" aria-hidden="true">
+            <span class="trace-early" id="trace-low-label">Shorter</span>
+            <span class="trace-late" id="trace-high-label">Longer</span>
+            <div class="trace-field" id="analysis-trace"><span class="trace-center"></span></div>
+          </div>
+          <div class="timing-balance" aria-label="Timing distribution">
+            <span><strong id="analysis-early">0</strong> <span id="analysis-early-label">shorter</span></span>
+            <span><strong id="analysis-ontime">0</strong> <span id="analysis-ontime-label">steady</span></span>
+            <span><strong id="analysis-late">0</strong> <span id="analysis-late-label">longer</span></span>
+          </div>
+        </div>
+      </div>
+      <p class="analysis-message" id="analysis-message" role="status" aria-live="polite">Start a session, then play a steady pulse near the microphone.</p>
+      <section class="analysis-history" aria-labelledby="analysis-history-heading">
+        <div class="analysis-history-heading">
+          <h3 id="analysis-history-heading">Recent local sessions</h3>
+          <span id="analysis-history-count">0 saved</span>
+        </div>
+        <ol id="analysis-history-list"></ol>
+        <p id="analysis-history-empty">No saved sessions yet.</p>
+      </section>
+    </section>
+
     <div class="pillar" id="pillar-setlist">
       <button type="button" class="pillar-rail" id="rail-setlist"
         aria-expanded="true" aria-controls="pillar-setlist-body">
@@ -76,8 +222,14 @@ app.innerHTML = `
         <span class="rail-chevron" aria-hidden="true">&#9662;</span>
       </button>
       <div class="pillar-body" id="pillar-setlist-body">
-        <section class="panel" aria-labelledby="setlist-h">
-          <h2 id="setlist-h">Songs</h2>
+        <section class="panel setlist-panel" aria-labelledby="setlist-h">
+          <div class="panel-heading setlist-heading">
+            <div>
+              <p class="section-kicker">Current set</p>
+              <h2 id="setlist-h">Songs</h2>
+            </div>
+            <span class="panel-count" id="song-count">0 songs</span>
+          </div>
           <div class="field-row">
             <div class="field" style="flex:1">
               <label for="setlist-select">Setlist</label>
@@ -123,10 +275,10 @@ app.innerHTML = `
         <span class="rail-chevron" aria-hidden="true">&#9662;</span>
       </button>
       <div class="pillar-body" id="pillar-satellites-body">
-    <section class="panel" aria-labelledby="mixer-h">
+    <section class="panel rack-panel" aria-labelledby="mixer-h">
       <h2><button type="button" class="panel-toggle" id="toggle-mixer"
         aria-expanded="true" aria-controls="mixer-body">
-        <span id="mixer-h">Subdivision mixer</span>
+        <span><span id="mixer-h">Subdivision mixer</span><small>Blend rhythmic layers</small></span>
         <span class="rail-chevron" aria-hidden="true">&#9662;</span>
       </button></h2>
       <div class="panel-body" id="mixer-body">
@@ -134,10 +286,10 @@ app.innerHTML = `
       </div>
     </section>
 
-    <section class="panel" aria-labelledby="sound-h">
+    <section class="panel rack-panel" aria-labelledby="sound-h">
       <h2><button type="button" class="panel-toggle" id="toggle-sound"
         aria-expanded="true" aria-controls="sound-body">
-        <span id="sound-h">Sound</span>
+        <span><span id="sound-h">Sound</span><small>Voice and output</small></span>
         <span class="rail-chevron" aria-hidden="true">&#9662;</span>
       </button></h2>
       <div class="panel-body" id="sound-body">
@@ -162,10 +314,10 @@ app.innerHTML = `
       </div>
     </section>
 
-    <section class="panel" aria-labelledby="trainers-h">
+    <section class="panel rack-panel" aria-labelledby="trainers-h">
       <h2><button type="button" class="panel-toggle" id="toggle-trainers"
         aria-expanded="true" aria-controls="trainers-body">
-        <span id="trainers-h">Trainers</span>
+        <span><span id="trainers-h">Trainers</span><small>Practice automation</small></span>
         <span class="rail-chevron" aria-hidden="true">&#9662;</span>
       </button></h2>
       <div class="panel-body" id="trainers-body">
@@ -183,7 +335,7 @@ app.innerHTML = `
           <input type="number" id="gap-mute" min="1" max="32" value="${settings.gap.muteBars}" />
         </div>
       </div>
-      <div class="field-row" style="margin-top: var(--gap-2)">
+      <div class="field-row">
         <div class="toggle-field">
           <input type="checkbox" id="sp-on" ${settings.speed.enabled ? "checked" : ""} />
           <label for="sp-on">Speed trainer</label>
@@ -227,6 +379,22 @@ app.innerHTML = `
     <button type="button" id="mobile-song-next" aria-label="Next song">&rarr;</button>
   </aside>
 
+  <dialog id="calibration-dialog" aria-labelledby="calibration-heading" aria-describedby="calibration-instructions calibration-status">
+    <form method="dialog" class="calibration-dialog-content">
+      <div class="dialog-header">
+        <h2 id="calibration-heading">Calibrate this audio device</h2>
+        <button type="submit" value="cancel" id="calibration-close" aria-label="Close calibration">Close</button>
+      </div>
+      <p id="calibration-instructions">Use speakers in a quiet room. Stop the metronome, do not play, and keep the microphone near your normal practice position. Ten isolated clicks will play.</p>
+      <div class="calibration-progress" aria-hidden="true"><span id="calibration-progress-bar"></span></div>
+      <p id="calibration-status" role="status" aria-live="polite">Ready to measure speaker-to-microphone round-trip latency.</p>
+      <div class="dialog-actions">
+        <button type="button" class="btn-primary" id="calibration-begin">Begin 10-click measurement</button>
+        <button type="submit" value="cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="library-dialog" aria-labelledby="library-heading" aria-describedby="library-status">
     <div class="dialog-header">
       <h2 id="library-heading">Song library</h2>
@@ -261,11 +429,482 @@ const mobileBpmValue = $<HTMLSpanElement>("mobile-bpm-value");
 const lampsEl = $<HTMLDivElement>("lamps");
 const srStatus = $<HTMLParagraphElement>("sr-status");
 const trainerStatus = $<HTMLParagraphElement>("trainer-status");
+const engineState = $<HTMLSpanElement>("engine-state");
 const singleKeyShortcuts = $<HTMLInputElement>("single-key-shortcuts");
 const singleKeyShortcutLegend = $<HTMLSpanElement>("single-key-shortcut-legend");
 
 function persist(): void {
   saveLastSettings(settings);
+}
+
+/* ---------- Timing Lab ---------- */
+
+type AnalysisUiState = "idle" | "requesting-permission" | "warming-up" | "live"
+  | "calibration" | "complete" | "unsupported" | "denied" | "disconnected"
+  | "processing-error";
+
+const analysisStateEl = $<HTMLSpanElement>("analysis-state");
+const analysisMessage = $<HTMLParagraphElement>("analysis-message");
+const analysisToggle = $<HTMLButtonElement>("analysis-toggle");
+const analysisReset = $<HTMLButtonElement>("analysis-reset");
+const analysisExport = $<HTMLButtonElement>("analysis-export");
+const analysisGrid = $<HTMLSelectElement>("analysis-grid");
+const analysisSensitivity = $<HTMLSelectElement>("analysis-sensitivity");
+const analysisOffset = $<HTMLInputElement>("analysis-offset");
+const analysisLevel = $<HTMLMeterElement>("analysis-level");
+const analysisDevice = $<HTMLParagraphElement>("analysis-device");
+const analysisCalibrationStatus = $<HTMLParagraphElement>("analysis-calibration-status");
+const analysisTrace = $<HTMLDivElement>("analysis-trace");
+const calibrationDialog = $<HTMLDialogElement>("calibration-dialog");
+const calibrationBegin = $<HTMLButtonElement>("calibration-begin");
+const calibrationStatus = $<HTMLParagraphElement>("calibration-status");
+const calibrationProgress = $<HTMLSpanElement>("calibration-progress-bar");
+let analysisHistory: AnalysisSessionRecord[] = loadAnalysisHistory();
+let analysisUiState: AnalysisUiState = "idle";
+let latestAnalysisSnapshot: AnalysisSnapshot = analysisSession.snapshot();
+let analysisTimer: number | null = null;
+let calibrationTimer: number | null = null;
+let analysisTransitioning = false;
+let lastInputStatus: MicrophoneInputStatus | null = null;
+let calibrationController: CalibrationController;
+
+const STATE_LABELS: Record<AnalysisUiState, string> = {
+  idle: "Mic off",
+  "requesting-permission": "Requesting permission",
+  "warming-up": "Warming up",
+  live: "Live",
+  calibration: "Calibrating",
+  complete: "Complete",
+  unsupported: "Unsupported",
+  denied: "Permission denied",
+  disconnected: "Mic disconnected",
+  "processing-error": "Processing error",
+};
+
+function setAnalysisState(state: AnalysisUiState, message: string): void {
+  analysisUiState = state;
+  analysisStateEl.dataset.state = state;
+  analysisStateEl.textContent = STATE_LABELS[state];
+  analysisMessage.textContent = message;
+  const pending = state === "requesting-permission" || state === "warming-up" || state === "calibration";
+  analysisToggle.disabled = pending || state === "unsupported";
+  analysisToggle.textContent = state === "live" || state === "warming-up"
+    ? "End and save"
+    : "Start analysis";
+}
+
+function formatMilliseconds(value: number | null, signed = false): string {
+  if (value === null) return "--";
+  const rounded = Math.round(value * 10) / 10;
+  return `${signed && rounded > 0 ? "+" : ""}${rounded} ms`;
+}
+
+function formatDuration(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+function renderAnalysisMode(): void {
+  const metronomeMode = latestAnalysisSnapshot.mode === "metronome";
+  $<HTMLElement>("analysis-mode").textContent = metronomeMode ? "Metronome sync" : "Free play";
+  $<HTMLElement>("analysis-mode-help").textContent = metronomeMode
+    ? "Hits are compared with every selected subdivision target, including muted gap bars."
+    : "Tempo locks from a steady repeated pulse; shorter or longer intervals are reported without early or late claims.";
+  $<HTMLElement>("analysis-deviation-label").textContent = metronomeMode ? "Current timing" : "Interval change";
+  $<HTMLElement>("analysis-bias-label").textContent = metronomeMode ? "Timing bias" : "Interval bias";
+  const labels = metronomeMode
+    ? ["Early", "Late", "early", "on time", "late"]
+    : ["Shorter", "Longer", "shorter", "steady", "longer"];
+  $<HTMLElement>("trace-low-label").textContent = labels[0];
+  $<HTMLElement>("trace-high-label").textContent = labels[1];
+  $<HTMLElement>("analysis-early-label").textContent = labels[2];
+  $<HTMLElement>("analysis-ontime-label").textContent = labels[3];
+  $<HTMLElement>("analysis-late-label").textContent = labels[4];
+}
+
+function renderAnalysisSnapshot(snapshot: AnalysisSnapshot): void {
+  latestAnalysisSnapshot = snapshot;
+  renderAnalysisMode();
+  $<HTMLElement>("analysis-score").textContent = snapshot.score === null ? "--" : String(snapshot.score);
+  $<HTMLElement>("analysis-grade").textContent = snapshot.grade;
+  $<HTMLElement>("analysis-bpm").textContent = snapshot.bpm === null ? "--" : snapshot.bpm.toFixed(1);
+  $<HTMLElement>("analysis-confidence").textContent = `${Math.round(snapshot.confidence * 100)}% confidence`;
+  $<HTMLElement>("analysis-deviation").textContent = formatMilliseconds(snapshot.currentDeviationMs, true);
+  $<HTMLElement>("analysis-mean").textContent = formatMilliseconds(snapshot.meanAbsoluteDeviationMs);
+  $<HTMLElement>("analysis-jitter").textContent = formatMilliseconds(snapshot.standardDeviationMs);
+  $<HTMLElement>("analysis-bias").textContent = formatMilliseconds(snapshot.averageOffsetMs, true);
+  $<HTMLElement>("analysis-hits").textContent = `${snapshot.analyzedHits} ${snapshot.analyzedHits === 1 ? "hit" : "hits"}`;
+  $<HTMLElement>("analysis-duration").textContent = formatDuration(snapshot.durationSeconds);
+  $<HTMLElement>("analysis-early").textContent = String(snapshot.earlyCount);
+  $<HTMLElement>("analysis-ontime").textContent = String(snapshot.onTimeCount);
+  $<HTMLElement>("analysis-late").textContent = String(snapshot.lateCount);
+  analysisTrace.querySelectorAll(".trace-hit").forEach((node) => node.remove());
+  for (const deviation of snapshot.recentDeviationsMs) {
+    const dot = document.createElement("span");
+    dot.className = "trace-hit";
+    dot.style.insetInlineStart = `${Math.min(100, Math.max(0, 50 + deviation / 2))}%`;
+    analysisTrace.appendChild(dot);
+  }
+}
+
+function renderCalibrationStatus(): void {
+  const calibration = analysisPreferences.calibration;
+  const date = calibration.measuredAt
+    ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(calibration.measuredAt))
+    : null;
+  analysisOffset.value = String(calibration.offsetMs);
+  analysisCalibrationStatus.textContent = calibration.quality === "measured"
+    ? `${calibration.offsetMs} ms measured${date ? ` on ${date}` : ""}${calibration.stale ? ". Recalibrate for the current device." : "."}`
+    : `${calibration.offsetMs} ms estimated or manually set. Run calibration for trusted timing.`;
+}
+
+function comparableTrend(record: AnalysisSessionRecord, index: number): string {
+  if (record.score === null) return "Score collecting";
+  const previous = analysisHistory.slice(index + 1).find(
+    (candidate) => candidate.mode === record.mode
+      && candidate.subdivision === record.subdivision
+      && candidate.score !== null,
+  );
+  if (!previous || previous.score === null) return "First comparable score";
+  const difference = record.score - previous.score;
+  if (difference === 0) return "No score change";
+  return `${difference > 0 ? "+" : ""}${difference} vs previous`;
+}
+
+function renderAnalysisHistory(): void {
+  const list = $<HTMLOListElement>("analysis-history-list");
+  list.replaceChildren();
+  $<HTMLElement>("analysis-history-count").textContent = `${analysisHistory.length} saved`;
+  $<HTMLElement>("analysis-history-empty").hidden = analysisHistory.length > 0;
+  analysisExport.disabled = analysisHistory.length === 0;
+  analysisHistory.slice(0, 8).forEach((record, index) => {
+    const item = document.createElement("li");
+    const summary = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = record.songTitle || (record.mode === "metronome" ? "Metronome session" : "Free-play session");
+    const metadata = document.createElement("span");
+    metadata.textContent = `${new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(record.recordedAt))} · ${record.hitCount} hits · ${record.playedBpm?.toFixed(1) ?? "--"} BPM`;
+    const trend = document.createElement("small");
+    trend.textContent = comparableTrend(record, index);
+    summary.append(title, metadata, trend);
+    const score = document.createElement("strong");
+    score.className = "history-score";
+    score.textContent = record.score === null ? "--" : String(record.score);
+    score.setAttribute("aria-label", record.score === null ? "Score unavailable" : `Score ${record.score}`);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Delete";
+    remove.setAttribute("aria-label", `Delete ${title.textContent}`);
+    remove.addEventListener("click", () => {
+      if (!window.confirm(`Delete ${title.textContent} from local history?`)) return;
+      analysisHistory = deleteAnalysisSession(record.id);
+      renderAnalysisHistory();
+      setAnalysisState("complete", "The saved session was deleted from this browser.");
+    });
+    item.append(summary, score, remove);
+    list.appendChild(item);
+  });
+}
+
+function saveCurrentAnalysis(snapshot: AnalysisSnapshot): void {
+  if (snapshot.detectedHits === 0) return;
+  const song = library.find((candidate) => candidate.id === ui.activeSongId) ?? null;
+  const setlist = activeSetlist();
+  const record: AnalysisSessionRecord = {
+    id: globalThis.crypto?.randomUUID?.() ?? `session-${Date.now()}`,
+    recordedAt: new Date().toISOString(),
+    mode: snapshot.mode,
+    songId: song?.id ?? null,
+    songTitle: song?.title ?? null,
+    setlistId: setlist?.id ?? null,
+    setlistName: setlist?.name ?? null,
+    targetBpm: snapshot.mode === "metronome" ? settings.bpm : null,
+    playedBpm: snapshot.bpm,
+    confidence: Math.round(snapshot.confidence * 100),
+    score: snapshot.score,
+    meanAbsoluteErrorMs: snapshot.meanAbsoluteDeviationMs,
+    jitterMs: snapshot.standardDeviationMs,
+    biasMs: snapshot.averageOffsetMs,
+    hitCount: snapshot.analyzedHits,
+    durationSeconds: snapshot.durationSeconds,
+    subdivision: analysisPreferences.subdivision,
+  };
+  analysisHistory = saveAnalysisSession(record);
+  renderAnalysisHistory();
+}
+
+function stopAnalysisTimer(): void {
+  if (analysisTimer !== null) window.clearInterval(analysisTimer);
+  analysisTimer = null;
+}
+
+function startAnalysisTimer(): void {
+  stopAnalysisTimer();
+  let lastSummaryBucket = 0;
+  analysisTimer = window.setInterval(() => {
+    renderAnalysisSnapshot(analysisSession.snapshot());
+    const bucket = Math.floor(latestAnalysisSnapshot.durationSeconds / 15);
+    if (bucket > lastSummaryBucket && bucket > 0) {
+      lastSummaryBucket = bucket;
+      analysisMessage.textContent = `${latestAnalysisSnapshot.analyzedHits} hits analyzed. ${latestAnalysisSnapshot.score === null ? "Still collecting a reliable score." : `Current score ${latestAnalysisSnapshot.score}.`}`;
+    }
+  }, 1_000);
+}
+
+function syncAnalysisMode(): void {
+  const mode: AnalysisMode = engine.running ? "metronome" : "free";
+  const changed = analysisSession.setMode(mode);
+  renderAnalysisSnapshot(analysisSession.snapshot());
+  if (changed && (analysisUiState === "live" || analysisUiState === "warming-up")) {
+    setAnalysisState(
+      analysisUiState,
+      mode === "metronome"
+        ? "Mode changed to metronome sync. Timing collection restarted on the audio clock."
+        : "Mode changed to free play. Pulse collection restarted without an early or late reference.",
+    );
+  }
+}
+
+const microphoneAnalyzer = new MicrophoneAnalyzer(engine, {
+  onOnset: (time, strength) => {
+    if (calibrationController?.running) {
+      calibrationController.recordOnset(time);
+      return;
+    }
+    if (analysisUiState !== "live") return;
+    const snapshot = analysisSession.addOnset(time, strength);
+    renderAnalysisSnapshot(snapshot);
+    if (snapshot.detectedHits >= 8 && snapshot.confidence < 0.35) {
+      analysisMessage.textContent = "Input too noisy or irregular. Move closer, reduce ambient sound, or lower sensitivity.";
+    }
+  },
+  onLevel: (level) => {
+    analysisLevel.value = level;
+    analysisLevel.textContent = `${Math.round(level * 100)}%`;
+  },
+  onInputStatus: (status) => {
+    lastInputStatus = status;
+    analysisDevice.textContent = `${status.label}. ${status.browserProcessingActive
+      ? "Browser input processing is active, which can shift or soften attacks."
+      : "Echo cancellation, noise suppression, and auto gain are off."}`;
+  },
+  onUnexpectedStop: (message) => {
+    stopAnalysisTimer();
+    const state = message.toLowerCase().includes("disconnect") ? "disconnected" : "processing-error";
+    setAnalysisState(state, message);
+  },
+});
+
+calibrationController = new CalibrationController(engine, {
+  start: () => microphoneAnalyzer.start("medium"),
+  stop: () => microphoneAnalyzer.stop(),
+});
+
+engine.onScheduledBeat((beat) => {
+  if (analysisUiState === "live" && latestAnalysisSnapshot.mode === "metronome") {
+    analysisSession.addReferenceBeat(beat.time, beat.bpm);
+  }
+});
+
+async function startAnalysis(): Promise<void> {
+  if (analysisTransitioning) return;
+  analysisTransitioning = true;
+  syncAnalysisMode();
+  analysisSession.reset();
+  renderAnalysisSnapshot(analysisSession.snapshot());
+  setAnalysisState("requesting-permission", "Choose Allow if the browser asks to use your microphone.");
+  try {
+    await microphoneAnalyzer.start(analysisPreferences.sensitivity);
+    setAnalysisState("warming-up", "Listening to the room for a stable noise floor.");
+    window.setTimeout(() => {
+      if (!microphoneAnalyzer.running || analysisUiState !== "warming-up") return;
+      setAnalysisState("live", latestAnalysisSnapshot.mode === "metronome"
+        ? "Live. Play the selected pulse with headphones; muted gap bars still count."
+        : "Live. Repeat the selected pulse steadily; interval consistency appears after pulse lock.");
+      startAnalysisTimer();
+    }, 600);
+  } catch (error) {
+    const message = microphoneErrorMessage(error);
+    const denied = error instanceof DOMException
+      && (error.name === "NotAllowedError" || error.name === "SecurityError");
+    const unsupported = message.includes("HTTPS") || message.includes("AudioWorklet");
+    setAnalysisState(unsupported ? "unsupported" : denied ? "denied" : "processing-error", message);
+  } finally {
+    analysisTransitioning = false;
+  }
+}
+
+function endAndSaveAnalysis(): void {
+  microphoneAnalyzer.stop();
+  stopAnalysisTimer();
+  const snapshot = analysisSession.snapshot();
+  renderAnalysisSnapshot(snapshot);
+  saveCurrentAnalysis(snapshot);
+  setAnalysisState("complete", snapshot.detectedHits === 0
+    ? "Session ended with no detected hits, so nothing was saved."
+    : "Session ended and normalized metrics were saved locally. Raw audio was not stored.");
+}
+
+analysisToggle.addEventListener("click", () => {
+  if (analysisUiState === "live" || analysisUiState === "warming-up") endAndSaveAnalysis();
+  else void startAnalysis();
+});
+analysisReset.addEventListener("click", () => {
+  analysisSession.reset();
+  renderAnalysisSnapshot(analysisSession.snapshot());
+  setAnalysisState(analysisUiState === "live" ? "live" : "idle", "Current Timing Lab measurements were reset.");
+});
+analysisGrid.value = String(analysisPreferences.subdivision);
+analysisSensitivity.value = analysisPreferences.sensitivity;
+analysisGrid.addEventListener("change", () => {
+  analysisPreferences.subdivision = Number(analysisGrid.value) as AnalysisSubdivision;
+  analysisSession.setSubdivision(analysisPreferences.subdivision);
+  saveAnalysisPreferences(analysisPreferences);
+  renderAnalysisSnapshot(analysisSession.snapshot());
+  setAnalysisState(analysisUiState === "live" ? "live" : "idle", "Played pulse changed. Timing collection restarted.");
+});
+analysisSensitivity.addEventListener("change", () => {
+  analysisPreferences.sensitivity = analysisSensitivity.value as AnalysisSensitivity;
+  microphoneAnalyzer.setSensitivity(analysisPreferences.sensitivity);
+  saveAnalysisPreferences(analysisPreferences);
+});
+analysisOffset.addEventListener("change", () => {
+  const offsetMs = Math.min(250, Math.max(-250, Math.round(Number(analysisOffset.value) || 0)));
+  analysisPreferences.calibration = {
+    offsetMs,
+    measuredAt: null,
+    inputDeviceId: lastInputStatus?.deviceId ?? null,
+    quality: "estimated",
+    stale: false,
+  };
+  analysisSession.setInputOffset(offsetMs);
+  saveAnalysisPreferences(analysisPreferences);
+  renderCalibrationStatus();
+});
+$("analysis-calibration-reset").addEventListener("click", () => {
+  analysisPreferences.calibration = {
+    offsetMs: 0,
+    measuredAt: null,
+    inputDeviceId: null,
+    quality: "estimated",
+    stale: false,
+  };
+  analysisSession.setInputOffset(0);
+  saveAnalysisPreferences(analysisPreferences);
+  renderCalibrationStatus();
+});
+
+function exportAnalysisCsv(): void {
+  const header = ["recorded_at", "mode", "song", "setlist", "target_bpm", "played_bpm", "confidence_percent", "score", "mean_error_ms", "jitter_ms", "bias_ms", "hit_count", "duration_seconds", "subdivision"];
+  const quote = (value: string | number | null): string => `"${String(value ?? "").replaceAll('"', '""')}"`;
+  const rows = analysisHistory.map((record) => [
+    record.recordedAt, record.mode, record.songTitle, record.setlistName, record.targetBpm,
+    record.playedBpm, record.confidence, record.score, record.meanAbsoluteErrorMs,
+    record.jitterMs, record.biasMs, record.hitCount, record.durationSeconds, record.subdivision,
+  ].map(quote).join(","));
+  const url = URL.createObjectURL(new Blob([[header.join(","), ...rows].join("\n")], { type: "text/csv;charset=utf-8" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `ggcoder-timing-sessions-${new Date().toISOString().slice(0, 10)}.csv`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+analysisExport.addEventListener("click", exportAnalysisCsv);
+
+$("analysis-calibrate").addEventListener("click", () => {
+  if (engine.running) {
+    setAnalysisState("idle", "Stop the metronome before speaker-loopback calibration.");
+    return;
+  }
+  if (microphoneAnalyzer.running) endAndSaveAnalysis();
+  calibrationStatus.textContent = "Ready to measure speaker-to-microphone round-trip latency.";
+  calibrationProgress.style.inlineSize = "0%";
+  calibrationBegin.disabled = false;
+  calibrationBegin.textContent = "Begin 10-click measurement";
+  calibrationDialog.showModal();
+});
+
+calibrationBegin.addEventListener("click", async () => {
+  calibrationBegin.disabled = true;
+  calibrationStatus.textContent = "Requesting microphone access, then scheduling ten clicks.";
+  setAnalysisState("calibration", "Calibration is using the microphone and speaker loopback.");
+  try {
+    const run = await calibrationController.begin(lastInputStatus?.latencySeconds ?? null);
+    calibrationStatus.textContent = `Listening for ${CALIBRATION_CLICK_COUNT} clicks. Do not play.`;
+    calibrationProgress.style.transitionDuration = `${CALIBRATION_CLICK_INTERVAL_SECONDS * (CALIBRATION_CLICK_COUNT - 1) + 1}s`;
+    requestAnimationFrame(() => { calibrationProgress.style.inlineSize = "100%"; });
+    calibrationTimer = window.setTimeout(() => {
+      calibrationTimer = null;
+      const result = calibrationController.complete();
+      if (result.success && result.offsetMs !== null) {
+        analysisPreferences.calibration = {
+          offsetMs: result.offsetMs,
+          measuredAt: new Date().toISOString(),
+          inputDeviceId: lastInputStatus?.deviceId ?? null,
+          quality: "measured",
+          stale: false,
+        };
+        analysisSession.setInputOffset(result.offsetMs);
+        saveAnalysisPreferences(analysisPreferences);
+        renderCalibrationStatus();
+        calibrationStatus.textContent = `${result.message} Browser estimate before measurement was ${run.estimatedOffsetMs} ms.`;
+        setAnalysisState("complete", "Device calibration succeeded and was saved locally.");
+      } else {
+        calibrationStatus.textContent = result.message;
+        setAnalysisState("processing-error", "Calibration was not stable enough. Review the guidance and retry.");
+      }
+      calibrationBegin.disabled = false;
+      calibrationBegin.textContent = "Retry measurement";
+    }, (0.5 + CALIBRATION_CLICK_INTERVAL_SECONDS * (CALIBRATION_CLICK_COUNT - 1) + 0.6) * 1_000);
+  } catch (error) {
+    calibrationStatus.textContent = microphoneErrorMessage(error);
+    calibrationBegin.disabled = false;
+    calibrationBegin.textContent = "Retry measurement";
+    setAnalysisState("processing-error", "Calibration could not start. Check the microphone and retry.");
+  }
+});
+
+calibrationDialog.addEventListener("close", () => {
+  if (calibrationTimer !== null) window.clearTimeout(calibrationTimer);
+  calibrationTimer = null;
+  if (calibrationController.running) calibrationController.cancel();
+  if (analysisUiState === "calibration") setAnalysisState("idle", "Calibration cancelled. No offset was changed.");
+  $<HTMLButtonElement>("analysis-calibrate").focus();
+});
+
+navigator.mediaDevices?.addEventListener?.("devicechange", () => {
+  analysisPreferences.calibration = markCalibrationForDevice(analysisPreferences.calibration, null);
+  saveAnalysisPreferences(analysisPreferences);
+  renderCalibrationStatus();
+  if (microphoneAnalyzer.running) {
+    microphoneAnalyzer.stop();
+    stopAnalysisTimer();
+    setAnalysisState("disconnected", "The audio-device list changed. Reconnect or select the microphone, then retry.");
+  }
+});
+
+window.addEventListener("pagehide", () => {
+  stopAnalysisTimer();
+  if (calibrationTimer !== null) window.clearTimeout(calibrationTimer);
+  calibrationController.cancel();
+  microphoneAnalyzer.stop();
+});
+
+const tabletAnalysisPlacement = window.matchMedia("(min-width: 760px) and (max-width: 1199px)");
+function syncAnalysisPlacement(): void {
+  const panel = $<HTMLElement>("analysis-panel");
+  const anchor = tabletAnalysisPlacement.matches
+    ? $<HTMLElement>("pillar-setlist")
+    : document.querySelector<HTMLElement>(".pillar-metronome")!;
+  if (anchor.nextElementSibling !== panel) anchor.after(panel);
+}
+tabletAnalysisPlacement.addEventListener("change", syncAnalysisPlacement);
+syncAnalysisPlacement();
+renderAnalysisSnapshot(latestAnalysisSnapshot);
+renderCalibrationStatus();
+renderAnalysisHistory();
+if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia || !("AudioWorkletNode" in window)) {
+  setAnalysisState("unsupported", "Timing Lab requires HTTPS or localhost, microphone capture, and AudioWorklet support.");
 }
 
 /* ---------- Tempo ---------- */
@@ -427,6 +1066,7 @@ const songTitle = $<HTMLInputElement>("song-title");
 const songArtist = $<HTMLInputElement>("song-artist");
 const songBand = $<HTMLInputElement>("song-band");
 const songUpdate = $<HTMLButtonElement>("song-update");
+const songCount = $<HTMLSpanElement>("song-count");
 const faceTransport = $<HTMLDivElement>("face-transport");
 const transportNow = $<HTMLParagraphElement>("transport-now");
 const transportNext = $<HTMLParagraphElement>("transport-next");
@@ -508,6 +1148,7 @@ function renderSongs(): void {
   const songs = references.map(({ song }) => song);
   songList.innerHTML = "";
   songEmpty.hidden = songs.length > 0;
+  songCount.textContent = `${songs.length} ${songs.length === 1 ? "song" : "songs"}`;
   references.forEach(({ song, sourceIndex }, displayIndex) => {
     const li = document.createElement("li");
     if (song.id === ui.activeSongId) li.classList.add("active");
@@ -718,6 +1359,22 @@ $("library-close").addEventListener("click", () => libraryDialog.close());
 libraryDialog.addEventListener("close", () => {
   libraryOpener?.focus();
   libraryOpener = null;
+});
+libraryDialog.addEventListener("keydown", (event) => {
+  if (event.key !== "Tab") return;
+  const focusable = [...libraryDialog.querySelectorAll<HTMLElement>(
+    'button:not(:disabled), input:not(:disabled):not([tabindex="-1"]), select:not(:disabled)',
+  )].filter((element) => !element.hidden);
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (!first || !last) return;
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 });
 librarySearch.addEventListener("input", renderLibrary);
 
@@ -959,6 +1616,8 @@ function announce(msg: string): void {
 }
 
 function renderPlaybackState(running: boolean): void {
+  engineState.textContent = running ? "Running" : "Ready";
+  engineState.dataset.state = running ? "running" : "ready";
   for (const button of [startStop, mobileStartStop]) {
     button.textContent = running ? "Stop" : "Start";
     button.setAttribute("aria-pressed", String(running));
@@ -967,6 +1626,7 @@ function renderPlaybackState(running: boolean): void {
     bpmValue.textContent = String(settings.bpm);
     mobileBpmValue.textContent = String(settings.bpm);
   }
+  syncAnalysisMode();
 }
 
 let transportTransitioning = false;
@@ -987,12 +1647,16 @@ async function toggle(): Promise<void> {
     }
 
     try {
+      engineState.textContent = "Starting audio";
+      engineState.dataset.state = "pending";
       await engine.start();
       renderPlaybackState(true);
       announce("Started");
     } catch {
       engine.stop();
       renderPlaybackState(false);
+      engineState.textContent = "Audio unavailable";
+      engineState.dataset.state = "error";
       trainerStatus.textContent = "Audio could not start. Check browser audio permissions and try again.";
       announce("Audio could not start. Check browser audio permissions, then press Start to retry.");
       clearLamps();
