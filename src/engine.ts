@@ -137,6 +137,14 @@ export class MetronomeEngine {
     return this.scheduledBeats.subscribe(listener);
   }
 
+  /** Schedules an isolated speaker-loopback click on the shared audio clock. */
+  scheduleCalibrationClick(time: number): void {
+    if (!this.ctx || !this.master || !Number.isFinite(time)) {
+      throw new Error("The shared audio context is not ready for calibration.");
+    }
+    scheduleHit(this.ctx, this.master, "click", time, 1, true);
+  }
+
   /** Clears stale visuals and repairs stale lookahead without changing musical counters. */
   resync(): void {
     if (!this.running || !this.ctx) return;
