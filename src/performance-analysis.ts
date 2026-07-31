@@ -263,7 +263,7 @@ export class TimingAnalysisSession {
     return {
       mode: this.mode,
       bpm: this.stableBpm === null ? null : roundedMetric(this.stableBpm),
-      confidence: roundedMetric(this.tempoConfidence * 100),
+      confidence: roundedMetric(this.tempoConfidence),
       score,
       grade: score === null
         ? "Collecting"

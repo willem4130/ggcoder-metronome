@@ -7,6 +7,7 @@ const HOST = "127.0.0.1";
 const PORT = 5199;
 const BASE_URL = `http://${HOST}:${PORT}/`;
 const SCREENSHOT_DIR = ".gg/screenshots/layout";
+const CALIBRATION_CLICK_INTERVAL_SECONDS = 0.65;
 mkdirSync(SCREENSHOT_DIR, { recursive: true });
 
 const defaults = {
@@ -94,16 +95,143 @@ async function stopServer(server) {
   if (server.child.exitCode === null) server.child.kill("SIGKILL");
 }
 
-async function seededPage(browser, viewport, seed) {
-  const context = await browser.newContext({ viewport });
+async function seededPage(browser, viewport, seed, options = {}) {
+  const context = await browser.newContext({ viewport, acceptDownloads: true });
   await context.addInitScript((payload) => {
     localStorage.clear();
     localStorage.setItem("ggcoder-metronome.library.v1", JSON.stringify(payload.library));
     localStorage.setItem("ggcoder-metronome.setlists.v2", JSON.stringify(payload.setlists));
     localStorage.setItem("ggcoder-metronome.last.v1", JSON.stringify(payload.settings));
     localStorage.setItem("ggcoder-metronome.ui.v1", JSON.stringify(payload.ui));
+    if (payload.analysisPreferences) {
+      localStorage.setItem("ggcoder-metronome.analysis.preferences.v1", JSON.stringify(payload.analysisPreferences));
+    }
+    if (payload.analysisHistory) {
+      localStorage.setItem("ggcoder-metronome.analysis.history.v1", JSON.stringify(payload.analysisHistory));
+    }
+
+    window.__denyMic = payload.mediaMode === "denied";
+    window.__holdMic = payload.mediaMode === "held";
+    window.__scheduledAudioTimes = [];
+    window.__worklets = [];
+    let releaseMicrophone;
+    window.__releaseMic = () => releaseMicrophone?.();
+
+    class FakeAudioNode {
+      connect(destination) { return destination; }
+      disconnect() {}
+    }
+    class FakeAudioParam {
+      value = 0;
+      setValueAtTime(value) { this.value = value; }
+      exponentialRampToValueAtTime(value) { this.value = value; }
+    }
+    class FakeTrack {
+      label = "Mock USB microphone";
+      onended = null;
+      stop() {}
+      getSettings() {
+        return {
+          deviceId: "mock-mic-1",
+          latency: 0.012,
+          autoGainControl: false,
+          echoCancellation: false,
+          noiseSuppression: false,
+        };
+      }
+    }
+    class FakeStream {
+      track = new FakeTrack();
+      getTracks() { return [this.track]; }
+      getAudioTracks() { return [this.track]; }
+    }
+    class FakeAudioWorkletNode extends FakeAudioNode {
+      port = { onmessage: null, postMessage() {}, close() {} };
+      onprocessorerror = null;
+      constructor() {
+        super();
+        window.__worklets.push(this);
+      }
+    }
+    class FakeAudioContext {
+      state = "running";
+      destination = new FakeAudioNode();
+      baseLatency = 0.01;
+      outputLatency = 0.02;
+      audioWorklet = { addModule: async () => undefined };
+      get currentTime() { return performance.now() / 1000; }
+      async resume() { this.state = "running"; }
+      async suspend() { this.state = "suspended"; }
+      createGain() {
+        const node = new FakeAudioNode();
+        node.gain = new FakeAudioParam();
+        return node;
+      }
+      createBiquadFilter() {
+        const node = new FakeAudioNode();
+        node.frequency = new FakeAudioParam();
+        node.Q = new FakeAudioParam();
+        node.type = "lowpass";
+        return node;
+      }
+      createMediaStreamSource() { return new FakeAudioNode(); }
+      createOscillator() {
+        const node = new FakeAudioNode();
+        node.frequency = new FakeAudioParam();
+        node.type = "sine";
+        node.start = (time) => window.__scheduledAudioTimes.push(time);
+        node.stop = () => undefined;
+        return node;
+      }
+      createBufferSource() {
+        const node = new FakeAudioNode();
+        node.start = () => undefined;
+        return node;
+      }
+      createBuffer(_channels, length) {
+        const data = new Float32Array(length);
+        return { getChannelData: () => data };
+      }
+    }
+
+    window.AudioContext = FakeAudioContext;
+    window.webkitAudioContext = FakeAudioContext;
+    window.AudioWorkletNode = FakeAudioWorkletNode;
+    window.__emitOnset = (time, strength = 0.9) => {
+      const worklet = window.__worklets.at(-1);
+      worklet?.port.onmessage?.({
+        data: { type: "onset", time, strength, detectorDelaySeconds: 128 / 48_000 },
+      });
+    };
+    window.__emitLevel = (level) => {
+      const worklet = window.__worklets.at(-1);
+      worklet?.port.onmessage?.({ data: { type: "level", level } });
+    };
+    window.__disconnectMic = () => {
+      const stream = window.__lastStream;
+      stream?.track.onended?.();
+    };
+    window.__crashWorklet = () => window.__worklets.at(-1)?.onprocessorerror?.();
+
+    if (payload.mediaMode === "unsupported") {
+      Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: undefined });
+    } else {
+      const mediaDevices = new EventTarget();
+      mediaDevices.getUserMedia = async () => {
+        if (window.__denyMic) throw new DOMException("Denied", "NotAllowedError");
+        if (window.__holdMic) {
+          await new Promise((resolve) => { releaseMicrophone = resolve; });
+          window.__holdMic = false;
+        }
+        const stream = new FakeStream();
+        window.__lastStream = stream;
+        return stream;
+      };
+      Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: mediaDevices });
+    }
   }, seed);
   const page = await context.newPage();
+  if (options.clock) await page.clock.install();
   await page.goto(BASE_URL, { waitUntil: "domcontentloaded" });
   await page.waitForSelector("#startstop");
   return { context, page };
@@ -114,7 +242,7 @@ async function assertResponsiveLayout(browser) {
     const { context, page } = await seededPage(browser, { width, height: 900 }, populatedSeed);
     try {
       const result = await page.evaluate(() => {
-        const pillars = [...document.querySelectorAll(".pillar")]
+        const pillars = [...document.querySelectorAll(".pillar, .analysis-panel")]
           .filter((element) => getComputedStyle(element).display !== "none")
           .map((element) => {
             const rect = element.getBoundingClientRect();
@@ -132,6 +260,10 @@ async function assertResponsiveLayout(browser) {
         }
         const dock = document.getElementById("mobile-transport");
         const longSongButton = document.querySelector(".song-list li:nth-child(2) .song-load");
+        const tempo = document.querySelector(".pillar-metronome").getBoundingClientRect();
+        const analysis = document.getElementById("analysis-panel").getBoundingClientRect();
+        const setlist = document.getElementById("pillar-setlist").getBoundingClientRect();
+        const tools = document.getElementById("pillar-satellites").getBoundingClientRect();
         return {
           innerWidth,
           pageWidth: document.documentElement.scrollWidth,
@@ -140,6 +272,16 @@ async function assertResponsiveLayout(browser) {
           longSongOverflows: longSongButton
             ? longSongButton.scrollWidth > longSongButton.clientWidth + 1
             : true,
+          analysisOverflows: document.getElementById("analysis-panel").scrollWidth
+            > document.getElementById("analysis-panel").clientWidth + 1,
+          positions: {
+            tempo: { top: tempo.top, bottom: tempo.bottom },
+            analysis: { top: analysis.top, bottom: analysis.bottom },
+            setlist: { top: setlist.top, bottom: setlist.bottom },
+            tools: { top: tools.top, bottom: tools.bottom },
+          },
+          domOrder: [...document.getElementById("main-shell").children]
+            .map((element) => element.id || element.className),
         };
       });
 
@@ -147,6 +289,16 @@ async function assertResponsiveLayout(browser) {
       assert.ok(result.pageWidth <= width, `${width}px layout overflows horizontally (${result.pageWidth}px)`);
       assert.deepEqual(result.overlaps, [], `${width}px pillars overlap`);
       assert.equal(result.longSongOverflows, false, `${width}px long song row overflows`);
+      assert.equal(result.analysisOverflows, false, `${width}px Timing Lab overflows`);
+      if (width < 760) {
+        assert.ok(result.positions.analysis.top >= result.positions.tempo.bottom, `${width}px Timing Lab is not after tempo`);
+        assert.ok(result.positions.setlist.top >= result.positions.analysis.bottom, `${width}px setlist is not after Timing Lab`);
+      } else if (width < 1200) {
+        assert.ok(result.positions.analysis.top >= Math.max(result.positions.tempo.bottom, result.positions.setlist.bottom), `${width}px Timing Lab is not below tempo and setlist`);
+      } else {
+        assert.ok(Math.abs(result.positions.analysis.top - result.positions.tempo.top) < 2, `${width}px Timing Lab does not lead the desktop workspace`);
+        assert.ok(result.positions.setlist.top >= result.positions.analysis.bottom, `${width}px setlist is not below Timing Lab`);
+      }
       assert.equal(
         result.dockDisplay !== "none",
         width < 960,
@@ -172,6 +324,54 @@ async function assertResponsiveLayout(browser) {
     } finally {
       await context.close();
     }
+  }
+}
+
+async function assertZoomAndDirection(browser) {
+  const { context, page } = await seededPage(browser, { width: 390, height: 844 }, populatedSeed);
+  try {
+    await page.evaluate(() => {
+      document.documentElement.style.fontSize = "200%";
+    });
+    const zoomed = await page.evaluate(() => ({
+      viewport: innerWidth,
+      document: document.documentElement.scrollWidth,
+      clippedControls: [...document.querySelectorAll("button, input, select")].filter((element) => {
+        const rect = element.getBoundingClientRect();
+        return rect.left < -1 || rect.right > innerWidth + 1;
+      }).length,
+    }));
+    assert.ok(zoomed.document <= zoomed.viewport, "200% text causes horizontal overflow");
+    assert.equal(zoomed.clippedControls, 0, "200% text clips an interactive control");
+
+    await page.evaluate(() => {
+      document.documentElement.style.fontSize = "";
+      document.documentElement.dir = "rtl";
+    });
+    const rtl = await page.evaluate(() => ({
+      viewport: innerWidth,
+      document: document.documentElement.scrollWidth,
+    }));
+    assert.ok(rtl.document <= rtl.viewport, "RTL layout causes horizontal overflow");
+
+    await page.emulateMedia({ forcedColors: "active", reducedMotion: "reduce" });
+    const media = await page.evaluate(() => {
+      const start = document.getElementById("startstop");
+      start.focus();
+      const styles = getComputedStyle(start);
+      return {
+        forcedColors: matchMedia("(forced-colors: active)").matches,
+        reducedMotion: matchMedia("(prefers-reduced-motion: reduce)").matches,
+        focusVisible: styles.outlineStyle !== "none" && Number.parseFloat(styles.outlineWidth) >= 2,
+        transitionDuration: Number.parseFloat(styles.transitionDuration),
+      };
+    });
+    assert.ok(media.forcedColors, "Forced-colors emulation did not activate");
+    assert.ok(media.reducedMotion, "Reduced-motion emulation did not activate");
+    assert.ok(media.focusVisible, "Forced-colors mode lost the visible focus outline");
+    assert.ok(media.transitionDuration <= 0.01, "Reduced-motion mode retained a long transition");
+  } finally {
+    await context.close();
   }
 }
 
@@ -337,18 +537,164 @@ async function assertLibraryAndShortcutBehavior(browser) {
   }
 }
 
+async function assertAnalysisWorkflow(browser) {
+  const { context, page } = await seededPage(browser, { width: 1280, height: 1000 }, populatedSeed);
+  try {
+    assert.equal(await page.locator("#analysis-state").textContent(), "Mic off");
+    await page.click("#analysis-toggle");
+    await page.locator("#analysis-state").filter({ hasText: "Live" }).waitFor();
+    await page.evaluate(() => {
+      window.__emitLevel(0.72);
+      for (let index = 0; index < 22; index += 1) window.__emitOnset(10 + index * 0.5);
+    });
+    assert.notEqual(await page.locator("#analysis-bpm").textContent(), "--", "Live analysis did not report BPM");
+    assert.ok(Number(await page.locator("#analysis-hits").textContent().then((text) => text.split(" ")[0])) >= 8);
+    assert.equal(await page.locator("#analysis-mode").textContent(), "Free play");
+    assert.equal(await page.locator("#analysis-early-label").textContent(), "shorter");
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/1280-analysis-live.png`, fullPage: true });
+
+    await page.click("#analysis-toggle");
+    assert.equal(await page.locator("#analysis-state").textContent(), "Complete");
+    assert.equal(await page.locator("#analysis-history-list li").count(), 1);
+    const stored = await page.evaluate(() => JSON.parse(
+      localStorage.getItem("ggcoder-metronome.analysis.history.v1"),
+    ));
+    assert.equal(stored.length, 1, "Completed analysis was not saved");
+    assert.equal("onsets" in stored[0], false, "Raw onset data leaked into history");
+
+    const downloadPromise = page.waitForEvent("download");
+    await page.click("#analysis-export");
+    const download = await downloadPromise;
+    assert.ok((await download.suggestedFilename()).endsWith(".csv"), "Timing history export is not CSV");
+
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.click("#analysis-history-list button");
+    assert.equal(await page.locator("#analysis-history-list li").count(), 0, "Session delete failed");
+    await page.click("#analysis-reset");
+    assert.equal(await page.locator("#analysis-state").textContent(), "Mic off");
+
+    await page.click("#analysis-toggle");
+    await page.locator("#analysis-state").filter({ hasText: "Live" }).waitFor();
+    await page.click("#startstop");
+    await page.locator("#analysis-mode").filter({ hasText: "Metronome sync" }).waitFor();
+    assert.equal(await page.locator("#analysis-hits").textContent(), "0 hits", "Mode change retained incompatible hits");
+    await page.click("#startstop");
+    await page.locator("#analysis-mode").filter({ hasText: "Free play" }).waitFor();
+    await page.click("#analysis-toggle");
+  } finally {
+    await context.close();
+  }
+}
+
+async function assertAnalysisFailureStates(browser) {
+  const held = await seededPage(
+    browser,
+    { width: 390, height: 844 },
+    { ...emptySeed, mediaMode: "held" },
+  );
+  try {
+    await held.page.click("#analysis-toggle");
+    assert.equal(await held.page.locator("#analysis-state").textContent(), "Requesting permission");
+    await held.page.evaluate(() => window.__releaseMic());
+    await held.page.locator("#analysis-state").filter({ hasText: "Warming up" }).waitFor();
+    await held.page.locator("#analysis-state").filter({ hasText: "Live" }).waitFor();
+    await held.page.evaluate(() => window.__disconnectMic());
+    assert.equal(await held.page.locator("#analysis-state").textContent(), "Mic disconnected");
+  } finally {
+    await held.context.close();
+  }
+
+  const denied = await seededPage(
+    browser,
+    { width: 390, height: 844 },
+    { ...emptySeed, mediaMode: "denied" },
+  );
+  try {
+    await denied.page.click("#analysis-toggle");
+    await denied.page.locator("#analysis-state").filter({ hasText: "Permission denied" }).waitFor();
+    await denied.page.evaluate(() => { window.__denyMic = false; });
+    await denied.page.click("#analysis-toggle");
+    await denied.page.locator("#analysis-state").filter({ hasText: "Live" }).waitFor();
+    await denied.page.evaluate(() => window.__crashWorklet());
+    assert.equal(await denied.page.locator("#analysis-state").textContent(), "Processing error");
+  } finally {
+    await denied.context.close();
+  }
+
+  const unsupported = await seededPage(
+    browser,
+    { width: 390, height: 844 },
+    { ...emptySeed, mediaMode: "unsupported" },
+  );
+  try {
+    assert.equal(await unsupported.page.locator("#analysis-state").textContent(), "Unsupported");
+    assert.ok(await unsupported.page.locator("#analysis-toggle").isDisabled());
+  } finally {
+    await unsupported.context.close();
+  }
+}
+
+async function assertCalibrationWorkflow(browser) {
+  const { context, page } = await seededPage(
+    browser,
+    { width: 1024, height: 900 },
+    populatedSeed,
+    { clock: true },
+  );
+  try {
+    await page.click("#analysis-calibrate");
+    assert.equal(await page.evaluate(() => document.activeElement?.id), "calibration-begin");
+    await page.focus("#calibration-close");
+    await page.keyboard.press("Tab");
+    assert.ok(
+      await page.evaluate(() => document.getElementById("calibration-dialog").contains(document.activeElement)),
+      "Calibration dialog focus escaped",
+    );
+    await page.click("#calibration-begin");
+    assert.equal(await page.locator("#analysis-state").textContent(), "Calibrating");
+    const clickTimes = await page.evaluate(() => window.__scheduledAudioTimes.slice(-10));
+    assert.equal(clickTimes.length, 10, "Calibration did not schedule ten clicks");
+    await page.evaluate((times) => {
+      times.forEach((time, index) => window.__emitOnset(time + (80 + (index % 3) - 1) / 1000));
+    }, clickTimes);
+    await page.clock.fastForward((10 * CALIBRATION_CLICK_INTERVAL_SECONDS + 1) * 1000);
+    await page.locator("#calibration-status").filter({ hasText: "Measured" }).waitFor();
+    assert.equal(await page.locator("#analysis-offset").inputValue(), "80");
+    const saved = await page.evaluate(() => JSON.parse(
+      localStorage.getItem("ggcoder-metronome.analysis.preferences.v1"),
+    ));
+    assert.equal(saved.calibration.quality, "measured");
+
+    await page.click("#calibration-begin");
+    await page.clock.fastForward((10 * CALIBRATION_CLICK_INTERVAL_SECONDS + 1) * 1000);
+    await page.locator("#calibration-status").filter({ hasText: "required" }).waitFor();
+    assert.equal(await page.locator("#analysis-state").textContent(), "Processing error");
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/1024-calibration-failure.png` });
+
+    await page.click("#calibration-close");
+    assert.equal(await page.locator("#calibration-dialog").getAttribute("open"), null);
+    assert.equal(await page.evaluate(() => document.activeElement?.id), "analysis-calibrate");
+  } finally {
+    await context.close();
+  }
+}
+
 const server = startServer();
 let browser;
 try {
   await waitForServer(server);
   browser = await chromium.launch();
   await assertResponsiveLayout(browser);
+  await assertZoomAndDirection(browser);
   await assertEmptyTransport(browser);
   await assertCollapsedPillars(browser);
   await assertSongWorkflow(browser);
   await assertReferenceAndTransportBehavior(browser);
   await assertLibraryAndShortcutBehavior(browser);
-  console.log("Browser verification passed: responsive, transport, song, library, restore, and shortcut assertions.");
+  await assertAnalysisWorkflow(browser);
+  await assertAnalysisFailureStates(browser);
+  await assertCalibrationWorkflow(browser);
+  console.log("Browser verification passed: responsive, accessibility media, existing workflows, Timing Lab states/history/CSV, mocked microphone failures, and calibration success/failure.");
 } finally {
   await browser?.close();
   await stopServer(server);

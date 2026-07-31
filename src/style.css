@@ -843,6 +843,7 @@ input[type="range"]::-moz-range-thumb {
 
 .analysis-layout {
   display: grid;
+  align-items: start;
   gap: 14px;
   margin-top: 16px;
 }

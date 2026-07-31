@@ -822,6 +822,7 @@ $("analysis-calibrate").addEventListener("click", () => {
   calibrationBegin.disabled = false;
   calibrationBegin.textContent = "Begin 10-click measurement";
   calibrationDialog.showModal();
+  queueMicrotask(() => calibrationBegin.focus());
 });
 
 calibrationBegin.addEventListener("click", async () => {
