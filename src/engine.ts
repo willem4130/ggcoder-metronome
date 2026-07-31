@@ -20,6 +20,46 @@ export interface ScheduleAnchor {
   resynced: boolean;
 }
 
+export class AudioContextLeaseCounter {
+  private count = 0;
+
+  get active(): number {
+    return this.count;
+  }
+
+  acquire(): void {
+    this.count += 1;
+  }
+
+  release(): boolean {
+    if (this.count === 0) return false;
+    this.count -= 1;
+    return true;
+  }
+}
+
+export class ScheduledBeatBus {
+  private readonly listeners = new Set<(beat: VisualBeat) => void>();
+
+  subscribe(listener: (beat: VisualBeat) => void): () => void {
+    this.listeners.add(listener);
+    let subscribed = true;
+    return () => {
+      if (!subscribed) return;
+      subscribed = false;
+      this.listeners.delete(listener);
+    };
+  }
+
+  publish(beat: VisualBeat): void {
+    for (const listener of [...this.listeners]) listener(beat);
+  }
+}
+
+export function shouldSuspendAudioContext(running: boolean, activeLeases: number): boolean {
+  return !running && activeLeases === 0;
+}
+
 /** Pure stale-clock guard used by the audio scheduler and unit tests. */
 export function resolveScheduleAnchor(
   nextBeatTime: number,
@@ -44,6 +84,8 @@ export class MetronomeEngine {
   private beat = 0;
   private bar = 0;
   private visualQueue: VisualBeat[] = [];
+  private readonly audioContextLeases = new AudioContextLeaseCounter();
+  private readonly scheduledBeats = new ScheduledBeatBus();
 
   constructor(private getSettings: () => Settings) {}
 
@@ -63,16 +105,11 @@ export class MetronomeEngine {
 
   async start(): Promise<void> {
     if (this.running) return;
-    if (!this.ctx) {
-      this.ctx = new AudioContext({ latencyHint: "interactive" });
-      this.master = this.ctx.createGain();
-      this.master.connect(this.ctx.destination);
-    }
-    if (this.ctx.state === "suspended") await this.ctx.resume();
+    const ctx = await this.ensureAudioContext();
     this.beat = 0;
     this.bar = 0;
     this.visualQueue = [];
-    this.nextBeatTime = this.ctx.currentTime + START_LEAD_S;
+    this.nextBeatTime = ctx.currentTime + START_LEAD_S;
     this.timer = setInterval(() => this.schedule(), TICK_MS);
   }
 
@@ -82,7 +119,22 @@ export class MetronomeEngine {
       this.timer = null;
     }
     this.visualQueue = [];
-    void this.ctx?.suspend().catch(() => undefined);
+    this.suspendIfIdle();
+  }
+
+  /** Keeps the shared clock alive for microphone analysis, including free-play mode. */
+  async acquireAudioContext(): Promise<AudioContext> {
+    const context = await this.ensureAudioContext();
+    this.audioContextLeases.acquire();
+    return context;
+  }
+
+  releaseAudioContext(): void {
+    if (this.audioContextLeases.release()) this.suspendIfIdle();
+  }
+
+  onScheduledBeat(listener: (beat: VisualBeat) => void): () => void {
+    return this.scheduledBeats.subscribe(listener);
   }
 
   /** Clears stale visuals and repairs stale lookahead without changing musical counters. */
@@ -137,13 +189,15 @@ export class MetronomeEngine {
         }
       }
 
-      this.visualQueue.push({
+      const visualBeat: VisualBeat = {
         time: this.nextBeatTime,
         beat: this.beat,
         bar: this.bar,
         muted: barMuted,
         bpm,
-      });
+      };
+      this.visualQueue.push(visualBeat);
+      this.scheduledBeats.publish(visualBeat);
 
       this.nextBeatTime += beatDur;
       this.beat += 1;
@@ -152,5 +206,20 @@ export class MetronomeEngine {
         this.bar += 1;
       }
     }
+  }
+
+  private async ensureAudioContext(): Promise<AudioContext> {
+    if (!this.ctx) {
+      this.ctx = new AudioContext({ latencyHint: "interactive" });
+      this.master = this.ctx.createGain();
+      this.master.connect(this.ctx.destination);
+    }
+    if (this.ctx.state === "suspended") await this.ctx.resume();
+    return this.ctx;
+  }
+
+  private suspendIfIdle(): void {
+    if (!shouldSuspendAudioContext(this.running, this.audioContextLeases.active)) return;
+    void this.ctx?.suspend().catch(() => undefined);
   }
 }
