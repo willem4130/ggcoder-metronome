@@ -108,7 +108,10 @@ describe("metronome target matching", () => {
   it("applies calibrated device offset before matching", () => {
     const session = new TimingAnalysisSession("metronome", {
       ...DEFAULT_ANALYSIS_PREFERENCES,
-      inputOffsetMs: 20,
+      calibration: {
+        ...DEFAULT_ANALYSIS_PREFERENCES.calibration,
+        offsetMs: 20,
+      }
     });
     session.addReferenceBeat(1, 120);
     expect(session.addOnset(1.02).currentDeviationMs).toBeCloseTo(0);
@@ -184,11 +187,31 @@ describe("normalizeAnalysisPreferences", () => {
       subdivision: 3,
       sensitivity: "extreme",
       inputOffsetMs: 999,
-    })).toEqual({ subdivision: 1, sensitivity: "medium", inputOffsetMs: 250 });
+    })).toEqual({
+      subdivision: 1,
+      sensitivity: "medium",
+      calibration: {
+        offsetMs: 250,
+        measuredAt: null,
+        inputDeviceId: null,
+        quality: "estimated",
+        stale: false,
+      },
+    });
     expect(normalizeAnalysisPreferences({
       subdivision: 4,
       sensitivity: "high",
       inputOffsetMs: -42.4,
-    })).toEqual({ subdivision: 4, sensitivity: "high", inputOffsetMs: -42 });
+    })).toEqual({
+      subdivision: 4,
+      sensitivity: "high",
+      calibration: {
+        offsetMs: -42,
+        measuredAt: null,
+        inputDeviceId: null,
+        quality: "estimated",
+        stale: false,
+      },
+    });
   });
 });

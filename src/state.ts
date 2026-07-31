@@ -86,8 +86,45 @@ export interface ResolvedSongReference {
   sourceIndex: number;
 }
 
-export interface BackupPayload {
-  version: 1;
+export type AnalysisMode = "metronome" | "free";
+export type AnalysisSubdivision = 1 | 2 | 4;
+export type AnalysisSensitivity = "low" | "medium" | "high";
+
+export interface AnalysisCalibration {
+  offsetMs: number;
+  measuredAt: string | null;
+  inputDeviceId: string | null;
+  quality: "estimated" | "measured";
+  stale: boolean;
+}
+
+export interface AnalysisPreferences {
+  subdivision: AnalysisSubdivision;
+  sensitivity: AnalysisSensitivity;
+  calibration: AnalysisCalibration;
+}
+
+export interface AnalysisSessionRecord {
+  id: string;
+  recordedAt: string;
+  mode: AnalysisMode;
+  songId: string | null;
+  songTitle: string | null;
+  setlistId: string | null;
+  setlistName: string | null;
+  targetBpm: number | null;
+  playedBpm: number | null;
+  confidence: number;
+  score: number | null;
+  meanAbsoluteErrorMs: number | null;
+  jitterMs: number | null;
+  biasMs: number | null;
+  hitCount: number;
+  durationSeconds: number;
+  subdivision: AnalysisSubdivision;
+}
+
+interface BackupPayloadBase {
   exportedAt: string;
   library: LibrarySong[];
   setlists: Setlist[];
@@ -95,13 +132,35 @@ export interface BackupPayload {
   ui: UiState;
 }
 
+export interface BackupPayloadV1 extends BackupPayloadBase {
+  version: 1;
+}
+
+export interface BackupPayloadV2 extends BackupPayloadBase {
+  version: 2;
+  analysisPreferences: AnalysisPreferences;
+  analysisHistory: AnalysisSessionRecord[];
+}
+
+export type BackupPayload = BackupPayloadV1 | BackupPayloadV2;
+
 const PRESETS_KEY = "ggcoder-metronome.presets.v1";
 const LAST_KEY = "ggcoder-metronome.last.v1";
 const SETLISTS_V1_KEY = "ggcoder-metronome.setlists.v1";
 const SETLISTS_KEY = "ggcoder-metronome.setlists.v2";
 const LIBRARY_KEY = "ggcoder-metronome.library.v1";
 const UI_KEY = "ggcoder-metronome.ui.v1";
-const BACKUP_KEYS = [LIBRARY_KEY, SETLISTS_KEY, LAST_KEY, UI_KEY] as const;
+const ANALYSIS_PREFERENCES_KEY = "ggcoder-metronome.analysis.preferences.v1";
+const ANALYSIS_HISTORY_KEY = "ggcoder-metronome.analysis.history.v1";
+const MAX_ANALYSIS_HISTORY = 100;
+const BACKUP_KEYS = [
+  LIBRARY_KEY,
+  SETLISTS_KEY,
+  LAST_KEY,
+  UI_KEY,
+  ANALYSIS_PREFERENCES_KEY,
+  ANALYSIS_HISTORY_KEY,
+] as const;
 
 function safeParse(raw: string | null): unknown {
   if (!raw) return null;
@@ -139,6 +198,144 @@ function normalizedId(value: unknown): string | null {
 
 function normalizedNullableId(value: unknown): string | null {
   return value === null ? null : normalizedId(value);
+}
+
+function normalizedNullableString(value: unknown): string | null {
+  if (value === null) return null;
+  const text = normalizedString(value);
+  return text || null;
+}
+
+export function defaultAnalysisPreferences(): AnalysisPreferences {
+  return {
+    subdivision: 1,
+    sensitivity: "medium",
+    calibration: {
+      offsetMs: 0,
+      measuredAt: null,
+      inputDeviceId: null,
+      quality: "estimated",
+      stale: false,
+    },
+  };
+}
+
+export function normalizeAnalysisPreferences(value: unknown): AnalysisPreferences {
+  const defaults = defaultAnalysisPreferences();
+  const source = isRecord(value) ? value : {};
+  const calibration = isRecord(source.calibration) ? source.calibration : {};
+  // The prototype stored inputOffsetMs at the top level. Migrate it once.
+  const legacyOffset = source.inputOffsetMs;
+  const offsetSource = calibration.offsetMs ?? legacyOffset;
+  const measuredAt = typeof calibration.measuredAt === "string"
+    && !Number.isNaN(Date.parse(calibration.measuredAt))
+    ? calibration.measuredAt
+    : null;
+  return {
+    subdivision: source.subdivision === 1 || source.subdivision === 2 || source.subdivision === 4
+      ? source.subdivision
+      : defaults.subdivision,
+    sensitivity: source.sensitivity === "low"
+      || source.sensitivity === "medium"
+      || source.sensitivity === "high"
+      ? source.sensitivity
+      : defaults.sensitivity,
+    calibration: {
+      offsetMs: Math.round(boundedNumber(offsetSource, defaults.calibration.offsetMs, -250, 250)),
+      measuredAt,
+      inputDeviceId: normalizedNullableId(calibration.inputDeviceId),
+      quality: calibration.quality === "measured" && measuredAt !== null
+        ? "measured"
+        : "estimated",
+      stale: typeof calibration.stale === "boolean" ? calibration.stale : false,
+    },
+  };
+}
+
+export function loadAnalysisPreferences(): AnalysisPreferences {
+  return normalizeAnalysisPreferences(safeParse(localStorage.getItem(ANALYSIS_PREFERENCES_KEY)));
+}
+
+export function saveAnalysisPreferences(preferences: AnalysisPreferences): void {
+  localStorage.setItem(
+    ANALYSIS_PREFERENCES_KEY,
+    JSON.stringify(normalizeAnalysisPreferences(preferences)),
+  );
+}
+
+function normalizeAnalysisSession(value: unknown): AnalysisSessionRecord | null {
+  if (!isRecord(value)) return null;
+  const id = normalizedId(value.id);
+  const recordedAt = typeof value.recordedAt === "string"
+    && !Number.isNaN(Date.parse(value.recordedAt))
+    ? value.recordedAt
+    : null;
+  if (!id || !recordedAt || (value.mode !== "metronome" && value.mode !== "free")) return null;
+  const subdivision = value.subdivision === 1 || value.subdivision === 2 || value.subdivision === 4
+    ? value.subdivision
+    : null;
+  if (subdivision === null) return null;
+  const nullableMetric = (metric: unknown, minimum: number, maximum: number): number | null => {
+    if (metric === null) return null;
+    if (typeof metric !== "number" || !Number.isFinite(metric)) return null;
+    return Math.min(maximum, Math.max(minimum, metric));
+  };
+  return {
+    id,
+    recordedAt,
+    mode: value.mode,
+    songId: normalizedNullableId(value.songId),
+    songTitle: normalizedNullableString(value.songTitle),
+    setlistId: normalizedNullableId(value.setlistId),
+    setlistName: normalizedNullableString(value.setlistName),
+    targetBpm: nullableMetric(value.targetBpm, MIN_BPM, MAX_BPM),
+    playedBpm: nullableMetric(value.playedBpm, MIN_BPM, MAX_BPM),
+    confidence: boundedNumber(value.confidence, 0, 0, 100),
+    score: nullableMetric(value.score, 0, 100),
+    meanAbsoluteErrorMs: nullableMetric(value.meanAbsoluteErrorMs, 0, 2_000),
+    jitterMs: nullableMetric(value.jitterMs, 0, 2_000),
+    biasMs: nullableMetric(value.biasMs, -2_000, 2_000),
+    hitCount: boundedNumber(value.hitCount, 0, 0, 1_000_000, true),
+    durationSeconds: boundedNumber(value.durationSeconds, 0, 0, 86_400),
+    subdivision,
+  };
+}
+
+export function normalizeAnalysisHistory(value: unknown): AnalysisSessionRecord[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const records: AnalysisSessionRecord[] = [];
+  for (const candidate of value) {
+    const record = normalizeAnalysisSession(candidate);
+    if (!record || seen.has(record.id)) continue;
+    seen.add(record.id);
+    records.push(record);
+  }
+  return records
+    .sort((left, right) => Date.parse(right.recordedAt) - Date.parse(left.recordedAt))
+    .slice(0, MAX_ANALYSIS_HISTORY);
+}
+
+export function loadAnalysisHistory(): AnalysisSessionRecord[] {
+  return normalizeAnalysisHistory(safeParse(localStorage.getItem(ANALYSIS_HISTORY_KEY)));
+}
+
+export function saveAnalysisHistory(records: AnalysisSessionRecord[]): void {
+  localStorage.setItem(ANALYSIS_HISTORY_KEY, JSON.stringify(normalizeAnalysisHistory(records)));
+}
+
+export function saveAnalysisSession(record: AnalysisSessionRecord): AnalysisSessionRecord[] {
+  const normalized = normalizeAnalysisSession(record);
+  if (!normalized) throw new Error("Cannot save an invalid analysis session.");
+  const records = normalizeAnalysisHistory([normalized, ...loadAnalysisHistory()]);
+  saveAnalysisHistory(records);
+  return records;
+}
+
+export function deleteAnalysisSession(id: string): AnalysisSessionRecord[] {
+  const records = loadAnalysisHistory().filter((record) => record.id !== id);
+  saveAnalysisHistory(records);
+  return records;
 }
 
 /** Repairs malformed or partial settings without trusting nested persisted objects. */
@@ -483,15 +680,27 @@ function setlistsAreValid(value: unknown): value is Setlist[] {
   });
 }
 
-export function createBackupPayload(): BackupPayload {
+export function createBackupPayload(): BackupPayloadV2 {
   return {
-    version: 1,
+    version: 2,
     exportedAt: new Date().toISOString(),
     library: loadLibrary(),
     setlists: loadSetlists(),
     lastSettings: loadLastSettings(),
     ui: loadUiState(),
+    analysisPreferences: loadAnalysisPreferences(),
+    analysisHistory: loadAnalysisHistory(),
   };
+}
+
+function analysisPreferencesAreValid(value: unknown): value is AnalysisPreferences {
+  if (!isRecord(value) || !isRecord(value.calibration)) return false;
+  return JSON.stringify(value) === JSON.stringify(normalizeAnalysisPreferences(value));
+}
+
+function analysisHistoryIsValid(value: unknown): value is AnalysisSessionRecord[] {
+  if (!Array.isArray(value)) return false;
+  return JSON.stringify(value) === JSON.stringify(normalizeAnalysisHistory(value));
 }
 
 /** Parses and fully validates a replacement backup before any storage write occurs. */
@@ -502,8 +711,8 @@ export function parseBackupPayload(raw: string): BackupPayload {
   } catch {
     throw new Error("This file is not valid JSON. Choose a GGCoder Metronome backup file.");
   }
-  if (!isRecord(value) || value.version !== 1) {
-    throw new Error("This backup version is not supported. Choose a version 1 backup file.");
+  if (!isRecord(value) || (value.version !== 1 && value.version !== 2)) {
+    throw new Error("This backup version is not supported. Choose a version 1 or 2 backup file.");
   }
   if (typeof value.exportedAt !== "string" || Number.isNaN(Date.parse(value.exportedAt))) {
     throw new Error("This backup is missing a valid export date.");
@@ -514,17 +723,28 @@ export function parseBackupPayload(raw: string): BackupPayload {
   if (!settingsAreValid(value.lastSettings) || !uiStateIsValid(value.ui)) {
     throw new Error("This backup contains invalid metronome settings or interface preferences.");
   }
+  if (value.version === 2
+    && (!analysisPreferencesAreValid(value.analysisPreferences)
+      || !analysisHistoryIsValid(value.analysisHistory))) {
+    throw new Error("This backup contains invalid Timing Lab preferences or history.");
+  }
   return value as unknown as BackupPayload;
 }
 
 /** Writes every current key atomically from the caller's perspective, rolling back on failure. */
 export function restoreBackupPayload(payload: BackupPayload, storage: Storage = localStorage): void {
   const snapshot = new Map(BACKUP_KEYS.map((key) => [key, storage.getItem(key)]));
+  const analysisPreferences = payload.version === 2
+    ? payload.analysisPreferences
+    : defaultAnalysisPreferences();
+  const analysisHistory = payload.version === 2 ? payload.analysisHistory : [];
   try {
     storage.setItem(LIBRARY_KEY, JSON.stringify(payload.library));
     storage.setItem(SETLISTS_KEY, JSON.stringify(payload.setlists));
     storage.setItem(LAST_KEY, JSON.stringify(payload.lastSettings));
     storage.setItem(UI_KEY, JSON.stringify(payload.ui));
+    storage.setItem(ANALYSIS_PREFERENCES_KEY, JSON.stringify(analysisPreferences));
+    storage.setItem(ANALYSIS_HISTORY_KEY, JSON.stringify(analysisHistory));
   } catch (error) {
     try {
       for (const [key, previous] of snapshot) {

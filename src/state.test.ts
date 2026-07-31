@@ -2,22 +2,32 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { MAX_BPM } from "./timing";
 import {
   createBackupPayload,
+  defaultAnalysisPreferences,
+  deleteAnalysisSession,
   defaultSettings,
   defaultUiState,
+  loadAnalysisHistory,
+  loadAnalysisPreferences,
   loadLastSettings,
   loadLibrary,
   loadSetlists,
   loadUiState,
+  normalizeAnalysisHistory,
+  normalizeAnalysisPreferences,
   normalizeSettings,
   parseBackupPayload,
   resolveSongReferences,
   resolveSongs,
   restoreBackupPayload,
+  saveAnalysisPreferences,
+  saveAnalysisSession,
   saveLastSettings,
   saveLibrary,
   saveSetlists,
   saveUiState,
-  type BackupPayload,
+  type AnalysisSessionRecord,
+  type BackupPayloadV1,
+  type BackupPayloadV2,
   type LibrarySong,
   type Preset,
   type Setlist,
@@ -30,6 +40,8 @@ const SETLISTS_V1_KEY = "ggcoder-metronome.setlists.v1";
 const SETLISTS_KEY = "ggcoder-metronome.setlists.v2";
 const LIBRARY_KEY = "ggcoder-metronome.library.v1";
 const UI_KEY = "ggcoder-metronome.ui.v1";
+const ANALYSIS_PREFERENCES_KEY = "ggcoder-metronome.analysis.preferences.v1";
+const ANALYSIS_HISTORY_KEY = "ggcoder-metronome.analysis.history.v1";
 
 /** Minimal in-memory localStorage so tests run without a DOM environment. */
 function stubLocalStorage(): void {
@@ -341,30 +353,115 @@ describe("resolved song source indexes", () => {
   });
 });
 
+function analysisRecord(overrides: Partial<AnalysisSessionRecord> = {}): AnalysisSessionRecord {
+  return {
+    id: "session-1",
+    recordedAt: "2026-07-30T12:00:00.000Z",
+    mode: "metronome",
+    songId: null,
+    songTitle: null,
+    setlistId: null,
+    setlistName: null,
+    targetBpm: 120,
+    playedBpm: 119.8,
+    confidence: 92,
+    score: 88,
+    meanAbsoluteErrorMs: 12,
+    jitterMs: 8,
+    biasMs: -3,
+    hitCount: 40,
+    durationSeconds: 20,
+    subdivision: 1,
+    ...overrides,
+  };
+}
+
+describe("Timing Lab preferences and local history", () => {
+  it("migrates the prototype offset and repairs malformed calibration metadata", () => {
+    expect(normalizeAnalysisPreferences({
+      subdivision: 4,
+      sensitivity: "high",
+      inputOffsetMs: 999,
+      calibration: { quality: "measured", measuredAt: "bad-date" },
+    })).toEqual({
+      subdivision: 4,
+      sensitivity: "high",
+      calibration: {
+        offsetMs: 250,
+        measuredAt: null,
+        inputDeviceId: null,
+        quality: "estimated",
+        stale: false,
+      },
+    });
+  });
+
+  it("persists normalized preferences", () => {
+    const preferences = defaultAnalysisPreferences();
+    preferences.calibration.offsetMs = 64;
+    saveAnalysisPreferences(preferences);
+    expect(loadAnalysisPreferences().calibration.offsetMs).toBe(64);
+  });
+
+  it("keeps only the newest 100 normalized records", () => {
+    const records = Array.from({ length: 105 }, (_, index) => analysisRecord({
+      id: `session-${index}`,
+      recordedAt: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+    }));
+    const normalized = normalizeAnalysisHistory(records);
+    expect(normalized).toHaveLength(100);
+    expect(normalized[0].id).toBe("session-104");
+    expect(normalized.at(-1)?.id).toBe("session-5");
+  });
+
+  it("saves and deletes session metrics without raw onsets", () => {
+    saveAnalysisSession(analysisRecord());
+    expect(loadAnalysisHistory()).toEqual([analysisRecord()]);
+    expect(JSON.parse(localStorage.getItem(ANALYSIS_HISTORY_KEY) ?? "[]")[0])
+      .not.toHaveProperty("onsets");
+    deleteAnalysisSession("session-1");
+    expect(loadAnalysisHistory()).toEqual([]);
+  });
+
+  it("drops malformed records rather than fabricating session history", () => {
+    expect(normalizeAnalysisHistory([
+      analysisRecord(),
+      { ...analysisRecord(), id: "", score: 999 },
+      { nope: true },
+    ])).toEqual([analysisRecord()]);
+  });
+});
+
 describe("versioned backups", () => {
-  function validBackup(): BackupPayload {
+  function validBackup(): BackupPayloadV2 {
     saveLibrary([librarySong({ id: "song", title: "Opener" })]);
     saveSetlists([{ id: "set", name: "Show", songIds: ["song"] }]);
     saveLastSettings({ ...defaultSettings(), bpm: 96 });
     saveUiState({ ...defaultUiState(), activeSetlistId: "set", activeSongId: "song" });
+    const preferences = defaultAnalysisPreferences();
+    preferences.calibration.offsetMs = 72;
+    saveAnalysisPreferences(preferences);
+    saveAnalysisSession(analysisRecord());
     return createBackupPayload();
   }
 
-  it("creates and parses a complete version 1 payload", () => {
+  it("creates and parses a complete version 2 payload", () => {
     const backup = validBackup();
     const parsed = parseBackupPayload(JSON.stringify(backup));
 
-    expect(parsed.version).toBe(1);
+    expect(parsed.version).toBe(2);
     expect(parsed.library[0].title).toBe("Opener");
     expect(parsed.setlists[0].songIds).toEqual(["song"]);
     expect(parsed.lastSettings.bpm).toBe(96);
     expect(parsed.ui.activeSongId).toBe("song");
+    expect(parsed.version === 2 && parsed.analysisPreferences.calibration.offsetMs).toBe(72);
+    expect(parsed.version === 2 && parsed.analysisHistory).toEqual([analysisRecord()]);
   });
 
   it("rejects malformed JSON and malformed valid-JSON data", () => {
     expect(() => parseBackupPayload("{"))
       .toThrow("not valid JSON");
-    expect(() => parseBackupPayload(JSON.stringify({ version: 2 })))
+    expect(() => parseBackupPayload(JSON.stringify({ version: 3 })))
       .toThrow("version is not supported");
 
     const malformed = {
@@ -373,6 +470,23 @@ describe("versioned backups", () => {
     };
     expect(() => parseBackupPayload(JSON.stringify(malformed)))
       .toThrow("invalid metronome settings");
+
+    const invalidAnalysis = {
+      ...validBackup(),
+      analysisHistory: [{ ...analysisRecord(), confidence: 999 }],
+    };
+    expect(() => parseBackupPayload(JSON.stringify(invalidAnalysis)))
+      .toThrow("invalid Timing Lab");
+  });
+
+  it("accepts version 1 and migrates missing analysis data to safe defaults", () => {
+    const current = validBackup();
+    const { analysisPreferences: _preferences, analysisHistory: _history, ...base } = current;
+    const versionOne: BackupPayloadV1 = { ...base, version: 1 };
+    const parsed = parseBackupPayload(JSON.stringify(versionOne));
+    restoreBackupPayload(parsed);
+    expect(loadAnalysisPreferences()).toEqual(defaultAnalysisPreferences());
+    expect(loadAnalysisHistory()).toEqual([]);
   });
 
   it("restores all current keys after validation", () => {
@@ -385,6 +499,8 @@ describe("versioned backups", () => {
     expect(loadSetlists()[0].id).toBe("set");
     expect(loadLastSettings().bpm).toBe(96);
     expect(loadUiState().activeSongId).toBe("song");
+    expect(loadAnalysisPreferences().calibration.offsetMs).toBe(72);
+    expect(loadAnalysisHistory()).toEqual([analysisRecord()]);
   });
 
   it("rolls back every key when a storage write fails", () => {
@@ -394,6 +510,8 @@ describe("versioned backups", () => {
       [SETLISTS_KEY, "old-setlists"],
       [LAST_KEY, "old-settings"],
       [UI_KEY, "old-ui"],
+      [ANALYSIS_PREFERENCES_KEY, "old-analysis-preferences"],
+      [ANALYSIS_HISTORY_KEY, "old-analysis-history"],
     ]);
     let didFail = false;
     const failingStorage = {
@@ -420,6 +538,8 @@ describe("versioned backups", () => {
       [SETLISTS_KEY]: "old-setlists",
       [LAST_KEY]: "old-settings",
       [UI_KEY]: "old-ui",
+      [ANALYSIS_PREFERENCES_KEY]: "old-analysis-preferences",
+      [ANALYSIS_HISTORY_KEY]: "old-analysis-history",
     });
   });
 });

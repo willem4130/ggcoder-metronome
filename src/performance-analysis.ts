@@ -1,12 +1,13 @@
-export type AnalysisMode = "metronome" | "free";
-export type AnalysisSubdivision = 1 | 2 | 4;
-export type AnalysisSensitivity = "low" | "medium" | "high";
+import {
+  defaultAnalysisPreferences,
+  normalizeAnalysisPreferences,
+  type AnalysisMode,
+  type AnalysisPreferences,
+  type AnalysisSubdivision,
+} from "./state";
 
-export interface AnalysisPreferences {
-  subdivision: AnalysisSubdivision;
-  sensitivity: AnalysisSensitivity;
-  inputOffsetMs: number;
-}
+export { normalizeAnalysisPreferences };
+export type { AnalysisMode, AnalysisPreferences, AnalysisSensitivity, AnalysisSubdivision } from "./state";
 
 export interface TimingEvent {
   onsetTime: number;
@@ -62,34 +63,7 @@ const TEMPO_CLUSTER_TOLERANCE = 0.03;
 const MIN_TEMPO_CONFIDENCE = 0.55;
 const FREE_BASELINE_ALPHA = 0.02;
 
-export const DEFAULT_ANALYSIS_PREFERENCES: AnalysisPreferences = {
-  subdivision: 1,
-  sensitivity: "medium",
-  inputOffsetMs: 0,
-};
-
-export function normalizeAnalysisPreferences(value: unknown): AnalysisPreferences {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return { ...DEFAULT_ANALYSIS_PREFERENCES };
-  }
-  const candidate = value as Record<string, unknown>;
-  const subdivision = candidate.subdivision === 1 || candidate.subdivision === 2 || candidate.subdivision === 4
-    ? candidate.subdivision
-    : DEFAULT_ANALYSIS_PREFERENCES.subdivision;
-  const sensitivity = candidate.sensitivity === "low"
-    || candidate.sensitivity === "medium"
-    || candidate.sensitivity === "high"
-    ? candidate.sensitivity
-    : DEFAULT_ANALYSIS_PREFERENCES.sensitivity;
-  const offset = typeof candidate.inputOffsetMs === "number" && Number.isFinite(candidate.inputOffsetMs)
-    ? candidate.inputOffsetMs
-    : DEFAULT_ANALYSIS_PREFERENCES.inputOffsetMs;
-  return {
-    subdivision,
-    sensitivity,
-    inputOffsetMs: Math.round(clamp(offset, -250, 250)),
-  };
-}
+export const DEFAULT_ANALYSIS_PREFERENCES: AnalysisPreferences = defaultAnalysisPreferences();
 
 /**
  * Confidence-weighted pulse estimate from adjacent and short multi-hit spans.
@@ -195,7 +169,7 @@ export class TimingAnalysisSession {
   constructor(mode: AnalysisMode, preferences: AnalysisPreferences) {
     this.mode = mode;
     this.subdivision = preferences.subdivision;
-    this.inputOffsetMs = preferences.inputOffsetMs;
+    this.inputOffsetMs = preferences.calibration.offsetMs;
   }
 
   setMode(mode: AnalysisMode): boolean {
